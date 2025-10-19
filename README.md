@@ -80,6 +80,9 @@ M-x ticktick-sync
 | `ticktick-authorize` | Set up OAuth authentication |
 | `ticktick-refresh-token` | Manually refresh auth token |
 | `ticktick-toggle-sync-timer` | Toggle automatic timer-based syncing |
+| `ticktick-create-project` | Create a new TickTick project |
+| `ticktick-update-project` | Update current project properties |
+| `ticktick-delete-project` | Delete current project |
 
 ### Org File Structure
 
@@ -100,6 +103,33 @@ DEADLINE: <2024-01-15 Mon>
 :END:
 Task description content here.
 ```
+
+### Project Management
+
+You can now manage TickTick projects directly from Emacs:
+
+**Create a new project:**
+```elisp
+M-x ticktick-create-project
+```
+This will prompt for project name, color, view mode, and kind, then create both the TickTick project and corresponding org heading.
+
+**Update existing project:**
+```elisp
+M-x ticktick-update-project
+```
+Updates the properties of the current project (name, color, view mode, kind).
+
+**Delete project:**
+```elisp
+M-x ticktick-delete-project
+```
+Deletes the current project after confirmation. This removes both the TickTick project and the org heading.
+
+Project properties:
+- **Colors**: `#F18181` (red), `#7BC96F` (green), `#F9C74F` (yellow), `#90E0EF` (blue), `#C9A0DC` (purple), `#FF6B6B` (coral), `#4ECDC4` (teal), `#45B7D1` (sky blue)
+- **View modes**: `list`, `kanban`, `timeline`
+- **Kinds**: `TASK`, `NOTE`
 
 ## Configuration
 

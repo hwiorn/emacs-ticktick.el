@@ -59,6 +59,9 @@
 ;; - `ticktick-authorize': Set up OAuth authentication
 ;; - `ticktick-refresh-token': Manually refresh auth token
 ;; - `ticktick-toggle-sync-timer': Toggle automatic timer-based syncing
+;; - `ticktick-create-project': Create a new TickTick project
+;; - `ticktick-update-project': Update current project properties
+;; - `ticktick-delete-project': Delete current project
 ;;
 ;; Tasks are stored in the file specified by `ticktick-sync-file'
 ;; (defaults to ~/.emacs.d/ticktick/ticktick.org) with this structure:
@@ -686,6 +689,92 @@ Return the buffer position at the start of the heading."
                        #'ticktick--maybe-autosync-on-focus-change)
     (with-suppressed-warnings ((obsolete focus-out-hook))
       (remove-hook 'focus-out-hook #'ticktick--autosync))))
+
+;;; Project Management Functions ---------------------------------------------
+
+(defun ticktick--get-project-id ()
+  "Get the TickTick project ID from the current org heading."
+  (org-entry-get nil "TICKTICK_PROJECT_ID"))
+
+(defun ticktick--create-project (name &optional color view-mode kind)
+  "Create a new project with NAME, optional COLOR, VIEW-MODE, and KIND."
+  (let ((project-data (ticktick-request "POST" "/open/v1/project"
+                                        `(("name" . ,name)
+                                          ("color" . ,(or color "#F18181"))
+                                          ("viewMode" . ,(or view-mode "list"))
+                                          ("kind" . ,(or kind "TASK"))))))
+    (when project-data
+      (message "Created project: %s" (plist-get project-data :name))
+      project-data)))
+
+(defun ticktick--update-project (project-id name &optional color view-mode kind)
+  "Update existing PROJECT-ID with NAME, optional COLOR, VIEW-MODE, and KIND."
+  (let ((project-data (ticktick-request "POST" (format "/open/v1/project/%s" project-id)
+                                        `(("name" . ,name)
+                                          ("color" . ,(or color "#F18181"))
+                                          ("viewMode" . ,(or view-mode "list"))
+                                          ("kind" . ,(or kind "TASK"))))))
+    (when project-data
+      (message "Updated project: %s" (plist-get project-data :name))
+      project-data)))
+
+(defun ticktick--delete-project (project-id)
+  "Delete project with PROJECT-ID."
+  (let ((response (ticktick-request "DELETE" (format "/open/v1/project/%s" project-id))))
+    (when response
+      (message "Deleted project: %s" project-id)
+      response)))
+
+;;;###autoload
+(defun ticktick-create-project (name)
+  "Interactively create a new TickTick project with NAME."
+  (interactive "sProject name: ")
+  (let* ((color (completing-read "Project color (default #F18181): " 
+                                  '("#F18181" "#7BC96F" "#F9C74F" "#90E0EF" "#C9A0DC" "#FF6B6B" "#4ECDC4" "#45B7D1") nil t nil nil "#F18181"))
+         (view-mode (completing-read "View mode (default list): " 
+                                     '("list" "kanban" "timeline") nil t nil nil "list"))
+         (kind (completing-read "Project kind (default TASK): " 
+                                '("TASK" "NOTE") nil t nil nil "TASK"))
+         (project-data (ticktick--create-project name color view-mode kind)))
+    (when project-data
+      (with-current-buffer (find-file-noselect ticktick-sync-file)
+        (org-with-wide-buffer
+         (ticktick--create-project-heading (plist-get project-data :name) (plist-get project-data :id))
+         (save-buffer))))))
+
+;;;###autoload
+(defun ticktick-update-project ()
+  "Update the current TickTick project properties."
+  (interactive)
+  (let* ((project-id (ticktick--get-project-id)))
+    (unless project-id
+      (user-error "No TickTick project found at current position"))
+    (let* ((current-name (org-entry-get nil "ITEM"))
+           (name (read-string (format "Project name (current: %s): " current-name) current-name))
+           (color (completing-read "Project color: " 
+                                   '("#F18181" "#7BC96F" "#F9C74F" "#90E0EF" "#C9A0DC" "#FF6B6B" "#4ECDC4" "#45B7D1") nil t nil nil "#F18181"))
+           (view-mode (completing-read "View mode: " 
+                                       '("list" "kanban" "timeline") nil t nil nil "list"))
+           (kind (completing-read "Project kind: " 
+                                  '("TASK" "NOTE") nil t nil nil "TASK"))
+           (project-data (ticktick--update-project project-id name color view-mode kind)))
+      (when project-data
+        (org-edit-headline name)
+        (message "Project updated successfully")))))
+
+;;;###autoload
+(defun ticktick-delete-project ()
+  "Delete the current TickTick project after confirmation."
+  (interactive)
+  (let* ((project-id (ticktick--get-project-id))
+         (project-name (org-entry-get nil "ITEM")))
+    (unless project-id
+      (user-error "No TickTick project found at current position"))
+    (when (y-or-n-p (format "Are you sure you want to delete project '%s'? " project-name))
+       (ticktick--delete-project project-id)
+      (org-mark-subtree)
+      (kill-region (region-beginning) (region-end))
+      (message "Project '%s' deleted" project-name))))
 
 
 (provide 'ticktick)
