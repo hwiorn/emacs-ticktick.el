@@ -62,6 +62,8 @@
 ;; - `ticktick-create-project': Create a new TickTick project
 ;; - `ticktick-update-project': Update current project properties
 ;; - `ticktick-delete-project': Delete current project
+;; - `ticktick-enable-multi-file': Enable multi-file synchronization
+;; - `ticktick-disable-multi-file': Disable multi-file synchronization
 ;;
 ;; Tasks are stored in the file specified by `ticktick-sync-file'
 ;; (defaults to ~/.emacs.d/ticktick/ticktick.org) with this structure:
@@ -91,6 +93,19 @@
 ;;
 ;; For debugging OAuth issues:
 ;; M-x ticktick-debug-oauth
+;;
+;; MULTI-FILE SUPPORT:
+;;
+;; To enable synchronization across multiple org files:
+;; 1. Set `(setq ticktick-multi-file-support t)`
+;; 2. Configure project detection with one of these methods:
+;;    - Default: Projects with ORG_GTD property set to "Projects"
+;;    - Tag-based: Projects with "PROJECT" tag
+;; 3. Use `M-x ticktick-set-project-detection-by-property` or
+;;    `M-x ticktick-set-project-detection-by-tag` to switch methods
+;;
+;; Project headings in any org file will be synchronized with TickTick,
+;; with tasks stored in their respective files rather than ticktick.org
 
 ;;; Code:
 
@@ -139,6 +154,24 @@
 (defcustom ticktick-sync-file (expand-file-name "ticktick.org" ticktick-dir)
   "Path to the org file where all TickTick tasks will be synchronized."
   :type 'file
+  :group 'ticktick)
+
+(defcustom ticktick-multi-file-support nil
+  "If non-nil, enable multi-file synchronization across all open org files."
+  :type 'boolean
+  :group 'ticktick)
+
+(defcustom ticktick-project-detection-function 'ticktick--project-p-default
+  "Function to determine if an org heading represents a TickTick project.
+The function should take no arguments and return non-nil if the current
+heading is a project that should be synchronized with TickTick."
+  :type 'function
+  :group 'ticktick)
+
+(defcustom ticktick-project-name-function 'ticktick--project-name-default
+  "Function to extract the project name from an org heading.
+The function should take no arguments and return the project name as a string."
+  :type 'function
   :group 'ticktick)
 
 
@@ -587,6 +620,12 @@ Return the buffer position at the start of the heading."
 (defun ticktick-fetch-to-org ()
   "Fetch all tasks from TickTick and update org file without duplicating."
   (interactive)
+  (if ticktick-multi-file-support
+      (ticktick--fetch-to-org-multi)
+    (ticktick--fetch-to-org-single)))
+
+(defun ticktick--fetch-to-org-single ()
+  "Fetch tasks to single org file (original implementation)."
   (let* ((inbox-project `(:id "inbox" :name "Inbox"))
          (projects (ticktick-request "GET" "/open/v1/project"))
          (all-projects (cons inbox-project projects)))
@@ -596,31 +635,68 @@ Return the buffer position at the start of the heading."
          (ticktick--sync-project project))
        (save-buffer)))))
 
-(defun ticktick-push-from-org ()
-  "Push all updated org tasks back to TickTick."
-  (interactive)
-  (with-current-buffer (find-file-noselect ticktick-sync-file)
-    (org-with-wide-buffer
-     (goto-char (point-min))
-     (while (outline-next-heading)
-       (when (and (= (org-current-level) 2)
-                  (not (org-entry-get nil "TICKTICK_PROJECT_ID")))
-         (when (ticktick--should-sync-p)
-           (let* ((task (ticktick--heading-to-task))
-                  (project-id (org-entry-get nil "TICKTICK_PROJECT_ID" t))
-                  (id (org-entry-get nil "TICKTICK_ID")))
-             (if (and id (not (string-empty-p id)))
-                 (ticktick--update-task task project-id id)
-               (ticktick--create-task task project-id))))))
-     (save-buffer))))
+(defun ticktick--fetch-to-org-multi ()
+  "Fetch tasks to multiple org files based on project mapping."
+  (let* ((inbox-project `(:id "inbox" :name "Inbox"))
+         (projects (ticktick-request "GET" "/open/v1/project"))
+         (all-projects (cons inbox-project projects))
+         (project-file-mapping (ticktick--get-project-file-mapping)))
+    
+    (dolist (project all-projects)
+      (let* ((project-id (plist-get project :id))
+             (project-name (plist-get project :name))
+             (target-file (or (cdr (assoc project-id project-file-mapping))
+                              ticktick-sync-file)))
+        
+        (with-current-buffer (find-file-noselect target-file)
+          (org-with-wide-buffer
+           (let ((project-heading-pos (ticktick--find-project-heading project-name project-id)))
+             (if project-heading-pos
+                 ;; Project exists, sync tasks under it
+                 (progn
+                   (goto-char project-heading-pos)
+                   (outline-show-subtree)
+                   (let ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
+                         (tasks (plist-get project-data :tasks)))
+                     (dolist (task tasks)
+                       (ticktick--sync-task task project-heading-pos))))
+               
+               ;; Project doesn't exist, create it if it should be in this file
+               (when (or (string= target-file ticktick-sync-file)
+                         (ticktick--should-project-be-in-file-p project-name target-file))
+                 (let ((new-pos (ticktick--create-project-heading project-name project-id)))
+                   (outline-show-subtree)
+                   (let ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
+                         (tasks (plist-get project-data :tasks)))
+                       (dolist (task tasks)
+                         (ticktick--sync-task task new-pos)))))))
+             (save-buffer)))))
+    (message "Multi-file synchronization completed")))
 
+(defun ticktick--should-project-be-in-file-p (project-name file-path)
+  "Determine if PROJECT-NAME should be created in FILE-PATH.
+Checks if the file has project detection criteria that match the project name."
+  (with-current-buffer (find-file-noselect file-path)
+    (save-excursion
+      (goto-char (point-min))
+      (let ((found-match nil))
+        (while (and (not found-match) (outline-next-heading))
+          (when (funcall ticktick-project-detection-function)
+            (let ((existing-name (funcall ticktick-project-name-function)))
+              (when (string= existing-name project-name)
+                (setq found-match t)))))
+        found-match))))
 
-(defun ticktick-sync ()
-  "Two-way sync: push local changes first, then fetch remote updates."
-  (interactive)
-  (ticktick-push-from-org)
-  (sit-for 1)
-  (ticktick-fetch-to-org))
+(defun ticktick--update-project-from-org ()
+  "Update TickTick project properties from org heading properties.
+This function should be called when project properties in org are updated."
+  (let* ((project-id (ticktick--get-project-id))
+         (project-name (funcall ticktick-project-name-function))
+         (color (org-entry-get nil "TICKTICK_PROJECT_COLOR"))
+         (view-mode (org-entry-get nil "TICKTICK_PROJECT_VIEWMODE"))
+         (kind (org-entry-get nil "TICKTICK_PROJECT_KIND")))
+    (when project-id
+      (ticktick--update-project project-id project-name color view-mode kind))))
 
 (defun ticktick--autosync ()
   "Autosync if enabled."
@@ -695,6 +771,84 @@ Return the buffer position at the start of the heading."
 (defun ticktick--get-project-id ()
   "Get the TickTick project ID from the current org heading."
   (org-entry-get nil "TICKTICK_PROJECT_ID"))
+
+(defun ticktick--project-p-default ()
+  "Default function to determine if current heading is a TickTick project.
+Returns non-nil if the heading has ORG_GTD property set to \"Projects\"."
+  (and (= (org-current-level) 1)
+       (string= (org-entry-get nil "ORG_GTD") "Projects")))
+
+(defun ticktick--project-name-default ()
+  "Default function to extract project name from current heading.
+Returns the heading title without any TODO keywords or priority markers."
+  (let ((title (org-get-heading t t)))
+    (when title
+      (string-trim title))))
+
+(defun ticktick--project-p-by-tag ()
+  "Alternative project detection function using tags.
+Returns non-nil if the heading has \"PROJECT\" tag."
+  (and (= (org-current-level) 1)
+       (member "PROJECT" (org-get-tags))))
+
+(defun ticktick--project-name-from-title ()
+  "Alternative function to extract project name from heading title."
+  (org-get-heading t t))
+
+(defun ticktick--scan-org-files-for-projects ()
+  "Scan all open org files for project headings.
+Returns an alist of (file . project-positions) for each project found."
+  (let ((project-files '()))
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when (and (eq major-mode 'org-mode)
+                   (not (string-match-p "^\\*" (buffer-name))))
+          (save-excursion
+            (goto-char (point-min))
+            (let ((project-positions '()))
+              (while (outline-next-heading)
+                (when (funcall ticktick-project-detection-function)
+                  (push (point) project-positions)))
+              (when project-positions
+                (push (cons (buffer-file-name) (reverse project-positions)) project-files)))))))
+    project-files))
+
+(defun ticktick--get-project-file-mapping ()
+  "Create a mapping of TickTick project IDs to org file paths.
+Returns an alist of (project-id . file-path) pairs."
+  (let ((mapping '()))
+    (dolist (file-info (ticktick--scan-org-files-for-projects))
+      (let ((file-path (car file-info))
+            (positions (cdr file-info)))
+        (dolist (pos positions)
+          (with-current-buffer (find-file-noselect file-path)
+            (save-excursion
+              (goto-char pos)
+              (let ((project-id (ticktick--get-project-id))
+                    (project-name (funcall ticktick-project-name-function)))
+                (when project-id
+                  (push (cons project-id file-path) mapping))))))))
+    mapping))
+
+(defun ticktick--find-project-in-files (project-id)
+  "Find the org file containing the project with PROJECT-ID.
+Returns the file path if found, nil otherwise."
+  (cdr (assoc project-id (ticktick--get-project-file-mapping))))
+
+(defun ticktick--get-or-create-project-id (project-name)
+  "Get existing project ID or create new project with PROJECT-NAME.
+Returns the project ID."
+  (let ((existing-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
+    (if (and existing-id (not (string-empty-p existing-id)))
+        existing-id
+      (let ((project-data (ticktick--create-project project-name)))
+        (when project-data
+          (let ((new-id (plist-get project-data :id)))
+            (org-set-property "TICKTICK_PROJECT_ID" new-id)
+            (org-set-property "TICKTICK_PROJECT_COLOR" (plist-get project-data :color))
+            (org-set-property "TICKTICK_PROJECT_VIEWMODE" (plist-get project-data :viewMode))
+            (org-set-property "TICKTICK_PROJECT_KIND" (plist-get project-data :kind))
+            new-id))))))
 
 (defun ticktick--create-project (name &optional color view-mode kind)
   "Create a new project with NAME, optional COLOR, VIEW-MODE, and KIND."
