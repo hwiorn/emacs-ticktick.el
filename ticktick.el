@@ -1015,22 +1015,6 @@ Returns an alist of (project-id . file-path) pairs."
   "Scan all open org files and configured directories for project headings.
 Returns an alist of (file . project-positions) for each project found."
   (let ((project-files '()))
-    ;; First scan open buffers
-    (dolist (buffer (buffer-list))
-      (with-current-buffer buffer
-        (when (and (eq major-mode 'org-mode)
-                   (not (string-match-p "^\\*" (buffer-name))))
-          (save-excursion
-            (goto-char (point-min))
-            (let ((project-positions '()))
-              (while (outline-next-heading)
-                (when (funcall ticktick-project-detection-function)
-                  (push (point) project-positions))))
-            (when project-positions
-              (push (cons (buffer-file-name) (reverse project-positions)) project-files)))))
-      ;; Then scan configured directories
-      (append project-files (ticktick--scan-directories-for-projects))))
-  (let ((project-files '()))
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
         (when (and (eq major-mode 'org-mode)
@@ -1042,189 +1026,189 @@ Returns an alist of (file . project-positions) for each project found."
                 (when (funcall ticktick-project-detection-function)
                   (push (point) project-positions)))
               (when project-positions
-                (push (cons (buffer-file-name) (reverse project-positions)) project-files)))))
-        project-files))
+                (push (cons (buffer-file-name) (reverse project-positions)) project-files)))))))
+    project-files))
 
-    (defun ticktick--get-project-file-mapping ()
-      "Create a mapping of TickTick project IDs to org file paths.
+(defun ticktick--get-project-file-mapping ()
+  "Create a mapping of TickTick project IDs to org file paths.
 Returns an alist of (project-id . file-path) pairs."
-      (let ((mapping '()))
-        (dolist (file-info (ticktick--scan-org-files-for-projects))
-          (let ((file-path (car file-info))
-                (positions (cdr file-info)))
-            (dolist (pos positions)
-              (with-current-buffer (find-file-noselect file-path)
-                (save-excursion
-                  (goto-char pos)
-                  (let ((project-id (ticktick--get-project-id))
-                        (project-name (funcall ticktick-project-name-function)))
-                    (when project-id
-                      (push (cons project-id file-path) mapping))))))))
-        mapping))
+  (let ((mapping '()))
+    (dolist (file-info (ticktick--scan-org-files-for-projects))
+      (let ((file-path (car file-info))
+            (positions (cdr file-info)))
+        (dolist (pos positions)
+          (with-current-buffer (find-file-noselect file-path)
+            (save-excursion
+              (goto-char pos)
+              (let ((project-id (ticktick--get-project-id))
+                    (project-name (funcall ticktick-project-name-function)))
+                (when project-id
+                  (push (cons project-id file-path) mapping))))))))
+    mapping))
 
-    (defun ticktick--scan-directories-for-projects ()
-      "Scan configured directories for org files containing projects.
+(defun ticktick--scan-directories-for-projects ()
+  "Scan configured directories for org files containing projects.
 Returns an alist of (file . project-positions) for each project found."
-      (let ((project-files '()))
-        (dolist (dir ticktick-org-file-directories)
-          (when (file-directory-p dir)
-            (dolist (pattern ticktick-org-file-patterns)
-              ;; Use recursive directory scanning to find all matching files
-              (let ((files (ticktick--find-files-recursively dir pattern)))
-                (dolist (file files)
-                  (when (and (file-exists-p file)
-                             (not (ticktick--file-already-scanned-p file project-files)))
-                    (let ((file-projects (ticktick--scan-file-for-projects file)))
-                      (when file-projects
-                        (push (cons file file-projects) project-files)))))))))
-        project-files))
+  (let ((project-files '()))
+    (dolist (dir ticktick-org-file-directories)
+      (when (file-directory-p dir)
+        (dolist (pattern ticktick-org-file-patterns)
+          ;; Use recursive directory scanning to find all matching files
+          (let ((files (ticktick--find-files-recursively dir pattern)))
+            (dolist (file files)
+              (when (and (file-exists-p file)
+                         (not (ticktick--file-already-scanned-p file project-files)))
+                (let ((file-projects (ticktick--scan-file-for-projects file)))
+                  (when file-projects
+                    (push (cons file file-projects) project-files)))))))))
+    project-files))
 
-    (defun ticktick--find-files-recursively (dir pattern)
-      "Find files matching PATTERN recursively in DIR.
+(defun ticktick--find-files-recursively (dir pattern)
+  "Find files matching PATTERN recursively in DIR.
 Returns a list of absolute file paths."
-      (let ((files '())
-            (pattern-regex (wildcard-to-regexp pattern)))
-        (ticktick--walk-directory dir 
-                                  (lambda (file)
-                                    (when (and (string-match-p pattern-regex file)
-                                               (not (file-directory-p file)))
-                                      (push file files)))))
-      (reverse files)))
+  (let ((files '())
+        (pattern-regex (wildcard-to-regexp pattern)))
+    (ticktick--walk-directory dir 
+                              (lambda (file)
+                                (when (and (string-match-p pattern-regex file)
+                                           (not (file-directory-p file)))
+                                  (push file files))))
+    (reverse files)))
 
-  (defun ticktick--walk-directory (dir callback)
-    "Walk directory DIR recursively and call CALLBACK for each file."
-    (dolist (file (directory-files dir t "^[^.]"))
-      (cond
-       ((file-directory-p file)
-        (unless (member (file-name-nondirectory file) '("." ".."))
-          (ticktick--walk-directory file callback)))
-       (t
-        (funcall callback file)))))
+(defun ticktick--walk-directory (dir callback)
+  "Walk directory DIR recursively and call CALLBACK for each file."
+  (dolist (file (directory-files dir t "^[^.]"))
+    (cond
+     ((file-directory-p file)
+      (unless (member (file-name-nondirectory file) '("." ".."))
+        (ticktick--walk-directory file callback)))
+     (t
+      (funcall callback file)))))
 
-  (defun wildcard-to-regexp (wildcard)
-    "Convert wildcard pattern to regexp."
-    (let ((result (replace-regexp-in-string "\." "\\." wildcard)))
-      (setq result (replace-regexp-in-string "\*" ".*" result))
-      (setq result (replace-regexp-in-string "\?" "." result))
-      (concat "^" result "$")))
+(defun wildcard-to-regexp (wildcard)
+  "Convert wildcard pattern to regexp."
+  (let ((result (replace-regexp-in-string "\." "\\." wildcard)))
+    (setq result (replace-regexp-in-string "\*" ".*" result))
+    (setq result (replace-regexp-in-string "\?" "." result))
+    (concat "^" result "$")))
 
-  (defun ticktick--file-already-scanned-p (file project-files)
-    "Check if FILE has already been scanned in PROJECT-FILES."
-    (assoc file project-files))
+(defun ticktick--file-already-scanned-p (file project-files)
+  "Check if FILE has already been scanned in PROJECT-FILES."
+  (assoc file project-files))
 
-  (defun ticktick--scan-file-for-projects (file-path)
-    "Scan a specific org file for project headings.
+(defun ticktick--scan-file-for-projects (file-path)
+  "Scan a specific org file for project headings.
 Returns a list of buffer positions where projects are found."
-    (when (and (file-exists-p file-path)
-               (string-match-p "\\.org\\'" file-path))
-      (with-current-buffer (find-file-noselect file-path)
-        (save-excursion
-          (goto-char (point-min))
-          (let ((project-positions '()))
-            (while (outline-next-heading)
-              (when (funcall ticktick-project-detection-function)
-                (push (point) project-positions)))
-            (reverse project-positions)))))
+  (when (and (file-exists-p file-path)
+             (string-match-p "\\.org\\'" file-path))
+    (with-current-buffer (find-file-noselect file-path)
+      (save-excursion
+        (goto-char (point-min))
+        (let ((project-positions '()))
+          (while (outline-next-heading)
+            (when (funcall ticktick-project-detection-function)
+              (push (point) project-positions)))
+          (reverse project-positions))))))
 
-    (defun ticktick--find-project-in-files (project-id)
-      "Find the org file containing the project with PROJECT-ID.
+(defun ticktick--find-project-in-files (project-id)
+  "Find the org file containing the project with PROJECT-ID.
 Returns the file path if found, nil otherwise."
-      (cdr (assoc project-id (ticktick--get-project-file-mapping))))
+  (cdr (assoc project-id (ticktick--get-project-file-mapping))))
 
-    (defun ticktick--get-or-create-project-id (project-name)
-      "Get existing project ID or create new project with PROJECT-NAME.
+(defun ticktick--get-or-create-project-id (project-name)
+  "Get existing project ID or create new project with PROJECT-NAME.
 Returns the project ID."
-      (let ((existing-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
-        (if (and existing-id (not (string-empty-p existing-id)))
-            existing-id
-          (let ((project-data (ticktick--create-project project-name)))
-            (when project-data
-              (let ((new-id (plist-get project-data :id)))
-                (org-set-property "TICKTICK_PROJECT_ID" new-id)
-                (org-set-property "TICKTICK_PROJECT_COLOR" (plist-get project-data :color))
-                (org-set-property "TICKTICK_PROJECT_VIEWMODE" (plist-get project-data :viewMode))
-                (org-set-property "TICKTICK_PROJECT_KIND" (plist-get project-data :kind))
-                new-id))))
+  (let ((existing-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
+    (if (and existing-id (not (string-empty-p existing-id)))
+        existing-id
+      (let ((project-data (ticktick--create-project project-name)))
+        (when project-data
+          (let ((new-id (plist-get project-data :id)))
+            (org-set-property "TICKTICK_PROJECT_ID" new-id)
+            (org-set-property "TICKTICK_PROJECT_COLOR" (plist-get project-data :color))
+            (org-set-property "TICKTICK_PROJECT_VIEWMODE" (plist-get project-data :viewMode))
+            (org-set-property "TICKTICK_PROJECT_KIND" (plist-get project-data :kind))
+            new-id))))))
 
-        (defun ticktick--create-project (name &optional color view-mode kind)
-          "Create a new project with NAME, optional COLOR, VIEW-MODE, and KIND."
-          (let ((project-data (ticktick-request "POST" "/open/v1/project"
-                                                `(("name" . ,name)
-                                                  ("color" . ,(or color "#F18181"))
-                                                  ("viewMode" . ,(or view-mode "list"))
-                                                  ("kind" . ,(or kind "TASK"))))))
-            (when project-data
-              (message "Created project: %s" (plist-get project-data :name))
-              project-data)))
+(defun ticktick--create-project (name &optional color view-mode kind)
+  "Create a new project with NAME, optional COLOR, VIEW-MODE, and KIND."
+  (let ((project-data (ticktick-request "POST" "/open/v1/project"
+                                        `(("name" . ,name)
+                                          ("color" . ,(or color "#F18181"))
+                                          ("viewMode" . ,(or view-mode "list"))
+                                          ("kind" . ,(or kind "TASK"))))))
+    (when project-data
+      (message "Created project: %s" (plist-get project-data :name))
+      project-data)))
 
-        (defun ticktick--update-project (project-id name &optional color view-mode kind)
-          "Update existing PROJECT-ID with NAME, optional COLOR, VIEW-MODE, and KIND."
-          (let ((project-data (ticktick-request "POST" (format "/open/v1/project/%s" project-id)
-                                                `(("name" . ,name)
-                                                  ("color" . ,(or color "#F18181"))
-                                                  ("viewMode" . ,(or view-mode "list"))
-                                                  ("kind" . ,(or kind "TASK"))))))
-            (when project-data
-              (message "Updated project: %s" (plist-get project-data :name))
-              project-data)))
+(defun ticktick--update-project (project-id name &optional color view-mode kind)
+  "Update existing PROJECT-ID with NAME, optional COLOR, VIEW-MODE, and KIND."
+  (let ((project-data (ticktick-request "POST" (format "/open/v1/project/%s" project-id)
+                                        `(("name" . ,name)
+                                          ("color" . ,(or color "#F18181"))
+                                          ("viewMode" . ,(or view-mode "list"))
+                                          ("kind" . ,(or kind "TASK"))))))
+    (when project-data
+      (message "Updated project: %s" (plist-get project-data :name))
+      project-data)))
 
-        (defun ticktick--delete-project (project-id)
-          "Delete project with PROJECT-ID."
-          (let ((response (ticktick-request "DELETE" (format "/open/v1/project/%s" project-id))))
-            (when response
-              (message "Deleted project: %s" project-id)
-              response)))
+(defun ticktick--delete-project (project-id)
+  "Delete project with PROJECT-ID."
+  (let ((response (ticktick-request "DELETE" (format "/open/v1/project/%s" project-id))))
+    (when response
+      (message "Deleted project: %s" project-id)
+      response)))
 
-        (defun ticktick-create-project (name)
-          "Interactively create a new TickTick project with NAME."
-          (interactive "sProject name: ")
-          (let* ((color (completing-read "Project color (default #F18181): " 
-                                         '("#F18181" "#7BC96F" "#F9C74F" "#90E0EF" "#C9A0DC" "#FF6B6B" "#4ECDC4" "#45B7D1") nil t nil nil "#F18181"))
-                 (view-mode (completing-read "View mode (default list): " 
-                                             '("list" "kanban" "timeline") nil t nil nil "list"))
-                 (kind (completing-read "Project kind (default TASK): " 
-                                        '("TASK" "NOTE") nil t nil nil "TASK"))
-                 (project-data (ticktick--create-project name color view-mode kind)))
-            (when project-data
-              (with-current-buffer (find-file-noselect ticktick-sync-file)
-                (org-with-wide-buffer
-                 (ticktick--create-project-heading (plist-get project-data :name) (plist-get project-data :id))
-                 (save-buffer))))))
-
-;;;###autoload
-        (defun ticktick-update-project ()
-          "Update the current TickTick project properties."
-          (interactive)
-          (let* ((project-id (ticktick--get-project-id)))
-            (unless project-id
-              (user-error "No TickTick project found at current position"))
-            (let* ((current-name (org-entry-get nil "ITEM"))
-                   (name (read-string (format "Project name (current: %s): " current-name) current-name))
-                   (color (completing-read "Project color: " 
-                                           '("#F18181" "#7BC96F" "#F9C74F" "#90E0EF" "#C9A0DC" "#FF6B6B" "#4ECDC4" "#45B7D1") nil t nil nil "#F18181"))
-                   (view-mode (completing-read "View mode: " 
-                                               '("list" "kanban" "timeline") nil t nil nil "list"))
-                   (kind (completing-read "Project kind: " 
-                                          '("TASK" "NOTE") nil t nil nil "TASK"))
-                   (project-data (ticktick--update-project project-id name color view-mode kind)))
-              (when project-data
-                (org-edit-headline name)
-                (message "Project updated successfully")))))
+(defun ticktick-create-project (name)
+  "Interactively create a new TickTick project with NAME."
+  (interactive "sProject name: ")
+  (let* ((color (completing-read "Project color (default #F18181): " 
+                                 '("#F18181" "#7BC96F" "#F9C74F" "#90E0EF" "#C9A0DC" "#FF6B6B" "#4ECDC4" "#45B7D1") nil t nil nil "#F18181"))
+         (view-mode (completing-read "View mode (default list): " 
+                                     '("list" "kanban" "timeline") nil t nil nil "list"))
+         (kind (completing-read "Project kind (default TASK): " 
+                                '("TASK" "NOTE") nil t nil nil "TASK"))
+         (project-data (ticktick--create-project name color view-mode kind)))
+    (when project-data
+      (with-current-buffer (find-file-noselect ticktick-sync-file)
+        (org-with-wide-buffer
+         (ticktick--create-project-heading (plist-get project-data :name) (plist-get project-data :id))
+         (save-buffer))))))
 
 ;;;###autoload
-        (defun ticktick-delete-project ()
-          "Delete the current TickTick project after confirmation."
-          (interactive)
-          (let* ((project-id (ticktick--get-project-id))
-                 (project-name (org-entry-get nil "ITEM")))
-            (unless project-id
-              (user-error "No TickTick project found at current position"))
-            (when (y-or-n-p (format "Are you sure you want to delete project '%s'? " project-name))
-              (ticktick--delete-project project-id)
-              (org-mark-subtree)
-              (kill-region (region-beginning) (region-end))
-              (message "Project '%s' deleted" project-name))))
+(defun ticktick-update-project ()
+  "Update the current TickTick project properties."
+  (interactive)
+  (let* ((project-id (ticktick--get-project-id)))
+    (unless project-id
+      (user-error "No TickTick project found at current position"))
+    (let* ((current-name (org-entry-get nil "ITEM"))
+           (name (read-string (format "Project name (current: %s): " current-name) current-name))
+           (color (completing-read "Project color: " 
+                                   '("#F18181" "#7BC96F" "#F9C74F" "#90E0EF" "#C9A0DC" "#FF6B6B" "#4ECDC4" "#45B7D1") nil t nil nil "#F18181"))
+           (view-mode (completing-read "View mode: " 
+                                       '("list" "kanban" "timeline") nil t nil nil "list"))
+           (kind (completing-read "Project kind: " 
+                                  '("TASK" "NOTE") nil t nil nil "TASK"))
+           (project-data (ticktick--update-project project-id name color view-mode kind)))
+      (when project-data
+        (org-edit-headline name)
+        (message "Project updated successfully")))))
+
+;;;###autoload
+(defun ticktick-delete-project ()
+  "Delete the current TickTick project after confirmation."
+  (interactive)
+  (let* ((project-id (ticktick--get-project-id))
+         (project-name (org-entry-get nil "ITEM")))
+    (unless project-id
+      (user-error "No TickTick project found at current position"))
+    (when (y-or-n-p (format "Are you sure you want to delete project '%s'? " project-name))
+      (ticktick--delete-project project-id)
+      (org-mark-subtree)
+      (kill-region (region-beginning) (region-end))
+      (message "Project '%s' deleted" project-name))))
 
 
-        (provide 'ticktick)
+(provide 'ticktick)
 ;;; ticktick.el ends here
