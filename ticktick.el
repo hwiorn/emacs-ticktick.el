@@ -669,8 +669,8 @@ Return the buffer position at the start of the heading."
                  (progn
                    (goto-char project-heading-pos)
                    (outline-show-subtree)
-                   (let ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
-                         (tasks (plist-get project-data :tasks)))
+                   (let* ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
+                          (tasks (plist-get project-data :tasks)))
                      (dolist (task tasks)
                        (ticktick--sync-task task project-heading-pos))))
                
@@ -679,8 +679,8 @@ Return the buffer position at the start of the heading."
                          (ticktick--should-project-be-in-file-p project-name target-file))
                  (let ((new-pos (ticktick--create-project-heading project-name project-id)))
                    (outline-show-subtree)
-                   (let ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
-                         (tasks (plist-get project-data :tasks)))
+                   (let* ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
+                          (tasks (plist-get project-data :tasks)))
                      (dolist (task tasks)
                        (ticktick--sync-task task new-pos)))))))
            (save-buffer)))))
@@ -713,16 +713,19 @@ Return the buffer position at the start of the heading."
 (defun ticktick--push-from-org-multi ()
   "Push tasks from multiple org files."
   (let ((project-files (ticktick--scan-org-files-for-projects)))
+    (message "TickTick: Found %d files with projects" (length project-files))
     (dolist (file-info project-files)
       (let ((file-path (car file-info))
             (positions (cdr file-info)))
+        (message "TickTick: Processing file %s with %d projects" file-path (length positions))
         (with-current-buffer (find-file-noselect file-path)
           (org-with-wide-buffer
            (dolist (pos positions)
              (save-excursion
                (goto-char pos)
-               (let ((project-id (ticktick--get-or-create-project-id 
-                                  (funcall ticktick-project-name-function))))
+               (let* ((project-name (funcall ticktick-project-name-function))
+                      (project-id (ticktick--get-or-create-project-id project-name)))
+                 (message "TickTick: Project '%s' -> ID: %s" project-name project-id)
                  (when project-id
                    ;; Process all tasks under this project
                    (org-map-entries
@@ -735,7 +738,8 @@ Return the buffer position at the start of the heading."
                               (ticktick--update-task task project-id id)
                             (ticktick--create-task task project-id)))))
                     nil 'tree)))))
-           (save-buffer)))))))
+           (save-buffer))))
+    (message "TickTick: Push from org files completed"))))
 
 (defun ticktick-sync ()
   "Two-way sync: push local changes first, then fetch remote updates."
@@ -755,9 +759,9 @@ Return the buffer position at the start of the heading."
     (sit-for 1)
     
     ;; Then fetch updates, ensuring proper file mapping
-    (let ((inbox-project `(:id "inbox" :name "Inbox"))
-          (projects (ticktick-request "GET" "/open/v1/project"))
-          (all-projects (cons inbox-project projects)))
+    (let* ((inbox-project `(:id "inbox" :name "Inbox"))
+           (projects (ticktick-request "GET" "/open/v1/project"))
+           (all-projects (cons inbox-project projects)))
       
       (dolist (project all-projects)
         (let* ((project-id (plist-get project :id))
@@ -773,8 +777,8 @@ Return the buffer position at the start of the heading."
                    (progn
                      (goto-char project-heading-pos)
                      (outline-show-subtree)
-                     (let ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
-                           (tasks (plist-get project-data :tasks)))
+                     (let* ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
+                            (tasks (plist-get project-data :tasks)))
                        (dolist (task tasks)
                          (ticktick--sync-task task project-heading-pos))))
                  
@@ -782,8 +786,8 @@ Return the buffer position at the start of the heading."
                  (when (string= target-file ticktick-sync-file)
                    (let ((new-pos (ticktick--create-project-heading project-name project-id)))
                      (outline-show-subtree)
-                     (let ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
-                           (tasks (plist-get project-data :tasks)))
+                     (let* ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
+                            (tasks (plist-get project-data :tasks)))
                        (dolist (task tasks)
                          (ticktick--sync-task task new-pos))))))))
             (save-buffer)))))
@@ -801,72 +805,23 @@ Checks if the file has project detection criteria that match the project name."
             (let ((existing-name (funcall ticktick-project-name-function)))
               (when (string= existing-name project-name)
                 (setq found-match t)))))
-        found-match)))
-
-  (defun ticktick--find-project-heading (project-name project-id)
-    "Find existing project heading by name or ID.
-Returns buffer position if found, nil otherwise."
-    (save-excursion
-      (goto-char (point-min))
-      (let ((name-regex (format "^\\* %s$" (regexp-quote project-name)))
-            (found-pos nil))
-        (while (and (not found-pos) (re-search-forward name-regex nil t))
-          (let ((pos (match-beginning 0)))
-            (save-excursion
-              (goto-char pos)
-              (when (or (not project-id)
-                        (string= (org-entry-get nil "TICKTICK_PROJECT_ID") project-id))
-                (setq found-pos pos)))))
-        found-pos)))
-
-  (defun ticktick--update-project-from-org ()
-    "Update TickTick project properties from org heading properties.
-This function should be called when project properties in org are updated."
-    (let* ((project-id (ticktick--get-project-id))
-           (project-name (funcall ticktick-project-name-function))
-           (color (org-entry-get nil "TICKTICK_PROJECT_COLOR"))
-           (view-mode (org-entry-get nil "TICKTICK_PROJECT_VIEWMODE"))
-           (kind (org-entry-get nil "TICKTICK_PROJECT_KIND")))
-      (when project-id
-        (ticktick--update-project project-id project-name color view-mode kind))))
-
-  (defun ticktick-enable-multi-file ()
-    "Enable multi-file synchronization mode."
-    (interactive)
-    (setq ticktick-multi-file-support t)
-    (message "TickTick multi-file support enabled"))
-
-  (defun ticktick-disable-multi-file ()
-    "Disable multi-file synchronization mode."
-    (interactive)
-    (setq ticktick-multi-file-support nil)
-    (message "TickTick multi-file support disabled"))
-
-  (defun ticktick-set-project-detection-by-property ()
-    "Set project detection to use ORG_GTD property (default)."
-    (interactive)
-    (setq ticktick-project-detection-function 'ticktick--project-p-default)
-    (setq ticktick-project-name-function 'ticktick--project-name-default)
-    (message "Project detection set to ORG_GTD property"))
-
-  (defun ticktick-set-project-detection-by-tag ()
-    "Set project detection to use PROJECT tag."
-    (interactive)
-    (setq ticktick-project-detection-function 'ticktick--project-p-by-tag)
-    (setq ticktick-project-name-function 'ticktick--project-name-from-title)
-    (message "Project detection set to PROJECT tag"))
-  "Determine if PROJECT-NAME should be created in FILE-PATH.
-Checks if the file has project detection criteria that match the project name."
-  (with-current-buffer (find-file-noselect file-path)
-    (save-excursion
-      (goto-char (point-min))
-      (let ((found-match nil))
-        (while (and (not found-match) (outline-next-heading))
-          (when (funcall ticktick-project-detection-function)
-            (let ((existing-name (funcall ticktick-project-name-function)))
-              (when (string= existing-name project-name)
-                (setq found-match t)))))
         found-match))))
+
+(defun ticktick--find-project-heading (project-name project-id)
+  "Find existing project heading by name or ID.
+Returns buffer position if found, nil otherwise."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((name-regex (format "^\\* %s$" (regexp-quote project-name)))
+          (found-pos nil))
+      (while (and (not found-pos) (re-search-forward name-regex nil t))
+        (let ((pos (match-beginning 0)))
+          (save-excursion
+            (goto-char pos)
+            (when (or (not project-id)
+                      (string= (org-entry-get nil "TICKTICK_PROJECT_ID") project-id))
+              (setq found-pos pos)))))
+      found-pos)))
 
 (defun ticktick--update-project-from-org ()
   "Update TickTick project properties from org heading properties.
@@ -878,6 +833,32 @@ This function should be called when project properties in org are updated."
          (kind (org-entry-get nil "TICKTICK_PROJECT_KIND")))
     (when project-id
       (ticktick--update-project project-id project-name color view-mode kind))))
+
+(defun ticktick-enable-multi-file ()
+  "Enable multi-file synchronization mode."
+  (interactive)
+  (setq ticktick-multi-file-support t)
+  (message "TickTick multi-file support enabled"))
+
+(defun ticktick-disable-multi-file ()
+  "Disable multi-file synchronization mode."
+  (interactive)
+  (setq ticktick-multi-file-support nil)
+  (message "TickTick multi-file support disabled"))
+
+(defun ticktick-set-project-detection-by-property ()
+  "Set project detection to use ORG_GTD property (default)."
+  (interactive)
+  (setq ticktick-project-detection-function 'ticktick--project-p-default)
+  (setq ticktick-project-name-function 'ticktick--project-name-default)
+  (message "Project detection set to ORG_GTD property"))
+
+(defun ticktick-set-project-detection-by-tag ()
+  "Set project detection to use PROJECT tag."
+  (interactive)
+  (setq ticktick-project-detection-function 'ticktick--project-p-by-tag)
+  (setq ticktick-project-name-function 'ticktick--project-name-from-title)
+  (message "Project detection set to PROJECT tag"))
 
 (defun ticktick--autosync ()
   "Autosync if enabled."
@@ -977,57 +958,26 @@ Returns non-nil if the heading has \"PROJECT\" tag."
   (org-get-heading t t))
 
 (defun ticktick--scan-org-files-for-projects ()
-  "Scan all open org files for project headings.
+  "Scan configured directories for org files containing project headings.
 Returns an alist of (file . project-positions) for each project found."
-  (let ((project-files '()))
-    (dolist (buffer (buffer-list))
-      (with-current-buffer buffer
-        (when (and (eq major-mode 'org-mode)
-                   (not (string-match-p "^\\*" (buffer-name))))
-          (save-excursion
-            (goto-char (point-min))
-            (let ((project-positions '()))
-              (while (outline-next-heading)
-                (when (funcall ticktick-project-detection-function)
-                  (push (point) project-positions)))
-              (when project-positions
-                (push (cons (buffer-file-name) (reverse project-positions)) project-files)))))))
-    project-files))
-
-(defun ticktick--get-project-file-mapping ()
-  "Create a mapping of TickTick project IDs to org file paths.
-Returns an alist of (project-id . file-path) pairs."
-  (let ((mapping '()))
-    (dolist (file-info (ticktick--scan-org-files-for-projects))
-      (let ((file-path (car file-info))
-            (positions (cdr file-info)))
-        (dolist (pos positions)
-          (with-current-buffer (find-file-noselect file-path)
+  (if ticktick-org-file-directories
+      (ticktick--scan-directories-for-projects)
+    ;; Fallback: if no directories configured, scan open org buffers
+    (let ((project-files '()))
+      (dolist (buffer (buffer-list))
+        (with-current-buffer buffer
+          (when (and (eq major-mode 'org-mode)
+                     (buffer-file-name)
+                     (not (string-match-p "^\\*" (buffer-name))))
             (save-excursion
-              (goto-char pos)
-              (let ((project-id (ticktick--get-project-id))
-                    (project-name (funcall ticktick-project-name-function)))
-                (when project-id
-                  (push (cons project-id file-path) mapping))))))))
-    mapping))
-
-(defun ticktick--scan-org-files-for-projects ()
-  "Scan all open org files and configured directories for project headings.
-Returns an alist of (file . project-positions) for each project found."
-  (let ((project-files '()))
-    (dolist (buffer (buffer-list))
-      (with-current-buffer buffer
-        (when (and (eq major-mode 'org-mode)
-                   (not (string-match-p "^\\*" (buffer-name))))
-          (save-excursion
-            (goto-char (point-min))
-            (let ((project-positions '()))
-              (while (outline-next-heading)
-                (when (funcall ticktick-project-detection-function)
-                  (push (point) project-positions)))
-              (when project-positions
-                (push (cons (buffer-file-name) (reverse project-positions)) project-files)))))))
-    project-files))
+              (goto-char (point-min))
+              (let ((project-positions '()))
+                (while (outline-next-heading)
+                  (when (funcall ticktick-project-detection-function)
+                    (push (point) project-positions)))
+                (when project-positions
+                  (push (cons (buffer-file-name) (reverse project-positions)) project-files)))))))
+      project-files)))
 
 (defun ticktick--get-project-file-mapping ()
   "Create a mapping of TickTick project IDs to org file paths.
@@ -1050,27 +1000,32 @@ Returns an alist of (project-id . file-path) pairs."
   "Scan configured directories for org files containing projects.
 Returns an alist of (file . project-positions) for each project found."
   (let ((project-files '()))
+    (message "TickTick: Scanning directories: %S" ticktick-org-file-directories)
     (dolist (dir ticktick-org-file-directories)
       (when (file-directory-p dir)
+        (message "TickTick: Scanning directory: %s" dir)
         (dolist (pattern ticktick-org-file-patterns)
           ;; Use recursive directory scanning to find all matching files
           (let ((files (ticktick--find-files-recursively dir pattern)))
+            (message "TickTick: Found %d files matching '%s' in %s" (length files) pattern dir)
             (dolist (file files)
               (when (and (file-exists-p file)
                          (not (ticktick--file-already-scanned-p file project-files)))
                 (let ((file-projects (ticktick--scan-file-for-projects file)))
                   (when file-projects
+                    (message "TickTick: Found %d projects in %s" (length file-projects) file)
                     (push (cons file file-projects) project-files)))))))))
+    (message "TickTick: Total files with projects: %d" (length project-files))
     project-files))
 
 (defun ticktick--find-files-recursively (dir pattern)
   "Find files matching PATTERN recursively in DIR.
 Returns a list of absolute file paths."
   (let ((files '())
-        (pattern-regex (wildcard-to-regexp pattern)))
-    (ticktick--walk-directory dir 
+        (pattern-regex (ticktick--wildcard-to-regexp pattern)))
+    (ticktick--walk-directory dir
                               (lambda (file)
-                                (when (and (string-match-p pattern-regex file)
+                                (when (and (string-match-p pattern-regex (file-name-nondirectory file))
                                            (not (file-directory-p file)))
                                   (push file files))))
     (reverse files)))
@@ -1085,11 +1040,11 @@ Returns a list of absolute file paths."
      (t
       (funcall callback file)))))
 
-(defun wildcard-to-regexp (wildcard)
+(defun ticktick--wildcard-to-regexp (wildcard)
   "Convert wildcard pattern to regexp."
-  (let ((result (replace-regexp-in-string "\." "\\." wildcard)))
-    (setq result (replace-regexp-in-string "\*" ".*" result))
-    (setq result (replace-regexp-in-string "\?" "." result))
+  (let ((result (regexp-quote wildcard)))
+    (setq result (replace-regexp-in-string "\\\\\\*" ".*" result))
+    (setq result (replace-regexp-in-string "\\\\\\?" "." result))
     (concat "^" result "$")))
 
 (defun ticktick--file-already-scanned-p (file project-files)
@@ -1101,13 +1056,22 @@ Returns a list of absolute file paths."
 Returns a list of buffer positions where projects are found."
   (when (and (file-exists-p file-path)
              (string-match-p "\\.org\\'" file-path))
+    (message "TickTick: Scanning file: %s" file-path)
     (with-current-buffer (find-file-noselect file-path)
+      ;; Ensure org-mode is active
+      (unless (eq major-mode 'org-mode)
+        (org-mode))
       (save-excursion
         (goto-char (point-min))
-        (let ((project-positions '()))
+        (let ((project-positions '())
+              (heading-count 0))
           (while (outline-next-heading)
+            (setq heading-count (1+ heading-count))
             (when (funcall ticktick-project-detection-function)
-              (push (point) project-positions)))
+              (let ((project-name (funcall ticktick-project-name-function)))
+                (message "TickTick:   Found project '%s' at position %d" project-name (point))
+                (push (point) project-positions))))
+          (message "TickTick:   Scanned %d headings, found %d projects" heading-count (length project-positions))
           (reverse project-positions))))))
 
 (defun ticktick--find-project-in-files (project-id)
