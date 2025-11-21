@@ -1042,6 +1042,329 @@ This allows matching by ID when available, or by name as fallback."
     (with-suppressed-warnings ((obsolete focus-out-hook))
       (add-hook 'focus-out-hook #'ticktick--autosync))))
 
+;;; Current File/Project Sync Functions -----------------------------------------
+
+;;;###autoload
+(defun ticktick-sync-current-file ()
+  "Sync the current org file with TickTick.
+This function will:
+1. Check if current file is a valid org file
+2. Push local changes to TickTick
+3. Fetch remote updates from TickTick
+4. Update only the current file"
+  (interactive)
+  (unless (eq major-mode 'org-mode)
+    (user-error "Current buffer is not in org-mode"))
+  
+  (unless (buffer-file-name)
+    (user-error "Current buffer is not visiting a file"))
+  
+  (ticktick--ensure-backend)
+  (let ((file-path (buffer-file-name)))
+    (message "TickTick: Syncing current file: %s" (file-name-nondirectory file-path))
+    
+    ;; Step 1: Push local changes
+    (ticktick--push-from-org-single-file file-path)
+    
+    ;; Step 2: Fetch remote updates
+    (sit-for 1)  ; Brief pause to avoid conflicts
+    (ticktick--fetch-to-org-single-file file-path)
+    
+    (message "TickTick: Current file sync completed")))
+
+;;;###autoload
+(defun ticktick-sync-current-project ()
+  "Sync the current project with TickTick.
+This function will:
+1. Find the project that contains the current cursor position
+2. Push local changes for this project only
+3. Fetch remote updates for this project only
+4. Update only tasks within this project"
+  (interactive)
+  (unless (eq major-mode 'org-mode)
+    (user-error "Current buffer is not in org-mode"))
+  
+  (unless (buffer-file-name)
+    (user-error "Current buffer is not visiting a file"))
+  
+  ;; Find the project containing current position
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((current-pos (point))
+          (project-pos nil)
+          (project-name nil)
+          (project-id nil))
+      
+      ;; Find parent project (level 1 heading with project detection)
+      (while (and (org-up-heading-safe)
+                  (> (org-current-level) 1)))
+      
+      (when (= (org-current-level) 1)
+        (setq project-pos (point))
+        (setq project-name (funcall ticktick-project-name-function))
+        (setq project-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
+      
+      (unless project-pos
+        (user-error "No project found at current position"))
+      
+      (unless (funcall ticktick-project-detection-function)
+        (user-error "Current heading is not detected as a TickTick project"))
+      
+      (ticktick--ensure-backend)
+      (let ((backend (ticktick--get-backend)))
+        (message "TickTick: Syncing project: %s" project-name)
+        
+        ;; Ensure project exists on server
+        (unless (and project-id (not (string-empty-p project-id)))
+          (setq project-id (ticktick--get-or-create-project-id project-name backend))
+          (when project-id
+            (org-entry-put nil "TICKTICK_PROJECT_ID" project-id)))
+        
+        (when project-id
+          ;; Step 1: Push local changes for this project
+          (ticktick--push-from-org-single-project backend project-pos project-id)
+          
+          ;; Step 2: Fetch remote updates for this project
+          (sit-for 1)  ; Brief pause to avoid conflicts
+          (ticktick--fetch-to-org-single-project backend project-pos project-id)
+          
+          (message "TickTick: Project sync completed: %s" project-name))))))
+
+;;;###autoload
+(defun ticktick-fetch-current-project-to-org ()
+  "Fetch tasks for the current project from TickTick to org.
+This only fetches updates (pull direction) and does not push local changes."
+  (interactive)
+  (unless (eq major-mode 'org-mode)
+    (user-error "Current buffer is not in org-mode"))
+  
+  ;; Find the project containing current position
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((project-pos nil)
+          (project-name nil)
+          (project-id nil))
+      
+      ;; Find parent project (level 1 heading with project detection)
+      (while (and (org-up-heading-safe)
+                  (> (org-current-level) 1)))
+      
+      (when (= (org-current-level) 1)
+        (setq project-pos (point))
+        (setq project-name (funcall ticktick-project-name-function))
+        (setq project-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
+      
+      (unless project-pos
+        (user-error "No project found at current position"))
+      
+      (unless (funcall ticktick-project-detection-function)
+        (user-error "Current heading is not detected as a TickTick project"))
+      
+      (ticktick--ensure-backend)
+      (let ((backend (ticktick--get-backend)))
+        (message "TickTick: Fetching project: %s" project-name)
+        
+        ;; Ensure project exists on server
+        (unless (and project-id (not (string-empty-p project-id)))
+          (setq project-id (ticktick--get-or-create-project-id project-name backend))
+          (when project-id
+            (org-entry-put nil "TICKTICK_PROJECT_ID" project-id)))
+        
+        (when project-id
+          (ticktick--fetch-to-org-single-project backend project-pos project-id)
+          (message "TickTick: Project fetch completed: %s" project-name))))))
+
+;;;###autoload
+(defun ticktick-push-current-project-from-org ()
+  "Push tasks for the current project from org to TickTick.
+This only pushes local changes (push direction) and does not fetch remote updates."
+  (interactive)
+  (unless (eq major-mode 'org-mode)
+    (user-error "Current buffer is not in org-mode"))
+  
+  ;; Find the project containing current position
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((project-pos nil)
+          (project-name nil)
+          (project-id nil))
+      
+      ;; Find parent project (level 1 heading with project detection)
+      (while (and (org-up-heading-safe)
+                  (> (org-current-level) 1)))
+      
+      (when (= (org-current-level) 1)
+        (setq project-pos (point))
+        (setq project-name (funcall ticktick-project-name-function))
+        (setq project-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
+      
+      (unless project-pos
+        (user-error "No project found at current position"))
+      
+      (unless (funcall ticktick-project-detection-function)
+        (user-error "Current heading is not detected as a TickTick project"))
+      
+      (ticktick--ensure-backend)
+      (let ((backend (ticktick--get-backend)))
+        (message "TickTick: Pushing project: %s" project-name)
+        
+        ;; Ensure project exists on server
+        (unless (and project-id (not (string-empty-p project-id)))
+          (setq project-id (ticktick--get-or-create-project-id project-name backend))
+          (when project-id
+            (org-entry-put nil "TICKTICK_PROJECT_ID" project-id)))
+        
+        (when project-id
+          (ticktick--push-from-org-single-project backend project-pos project-id)
+          (message "TickTick: Project push completed: %s" project-name))))))
+
+;;; Helper Functions for Current File/Project Sync ------------------------------
+
+(defun ticktick--push-from-org-single-file (file-path)
+  "Push changes from a single org FILE-PATH to TickTick."
+  (let ((backend (ticktick--get-backend))
+        (task-count 0)
+        (created-count 0)
+        (updated-count 0))
+    (with-current-buffer (find-file-noselect file-path)
+      (org-with-wide-buffer
+       (goto-char (point-min))
+       (while (outline-next-heading)
+         (when (and (= (org-current-level) 2)
+                    (not (org-entry-get nil "TICKTICK_PROJECT_ID")))
+           (setq task-count (1+ task-count))
+           (let ((title (org-get-heading t t t t)))
+             (message "TickTick: Processing task #%d: %s" task-count title))
+           (if (ticktick-common-should-sync-p)
+               (let* ((task (ticktick-common-org-to-task))
+                      (project-id (or (org-entry-get nil "TICKTICK_PROJECT_ID" t)
+                                      (ticktick--get-or-ensure-project-id backend))))
+                 ;; Update task's project-id
+                 (setf (ticktick-task-project-id task) project-id)
+                 (message "TickTick:   Task ID: %s, Project ID: %s" 
+                          (or (ticktick-task-id task) "none") project-id)
+                 (let ((id (ticktick-task-id task)))
+                   (if (and id (not (string-empty-p id)))
+                       (progn
+                         (message "TickTick:   Updating task...")
+                         (let ((updated (ticktick-backend-update-task backend task id project-id)))
+                           (when updated
+                             (when (ticktick-task-etag updated)
+                               (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))))
+                         (ticktick-common-update-sync-meta)
+                         (setq updated-count (1+ updated-count))
+                         (message "TickTick:   ✓ Updated: %s" (ticktick-task-title task)))
+                     (message "TickTick:   Creating new task...")
+                     (let ((created (ticktick-backend-create-task backend task project-id)))
+                       (if created
+                           (progn
+                             (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
+                             (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
+                             (ticktick-common-update-sync-meta)
+                             (setq created-count (1+ created-count))
+                             (message "TickTick:   ✓ Created: %s (ID: %s)"
+                                      (ticktick-task-title created)
+                                      (ticktick-task-id created)))
+                         (message "TickTick:   ✗ Failed to create task"))))))
+             (message "TickTick:   Task needs sync: no (skipped)"))))
+       (save-buffer)
+       (message "TickTick: Push completed - %d tasks found, %d created, %d updated"
+                task-count created-count updated-count))))
+
+(defun ticktick--fetch-to-org-single-file (file-path)
+  "Fetch tasks from TickTick to a single org FILE-PATH."
+  (let* ((backend (ticktick--get-backend))
+         (projects (ticktick-backend-fetch-projects backend)))
+    (with-current-buffer (find-file-noselect file-path)
+      (org-with-wide-buffer
+       (dolist (project projects)
+(let* ((project-id (ticktick-project-id project))
+                 (project-title (ticktick-project-name project))
+                 (project-heading-re (format "^\\* %s$" (regexp-quote project-title)))
+                 (project-pos (save-excursion
+                                (goto-char (point-min))
+                                (when (re-search-forward project-heading-re nil t)
+                                  (match-beginning 0)))))
+            (when project-pos
+              (goto-char project-pos)
+              (outline-show-subtree)
+              (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
+                (dolist (task tasks)
+                  (ticktick--sync-task task project-pos))))))
+       (save-buffer)))))
+
+(defun ticktick--push-from-org-single-project (backend project-pos project-id)
+  "Push changes from a single project at PROJECT-POS with PROJECT-ID."
+  (save-excursion
+    (goto-char project-pos)
+    (let ((project-level (org-current-level))
+          (task-count 0)
+          (created-count 0)
+          (updated-count 0)
+          (skipped-count 0))
+      
+      ;; Process all subtasks under this project
+      (save-excursion
+        (let ((end-of-project (save-excursion
+                              (goto-char project-pos)
+                              (org-end-of-subtree t t))))
+          (goto-char project-pos)
+          (org-map-entries
+           (lambda ()
+             (let* ((level (org-current-level))
+                    (title (org-get-heading t t t t))
+                    (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
+                    (should-sync (ticktick-common-should-sync-p)))
+               ;; Only process if:
+               ;; 1. Level is deeper than project level (not the project itself)
+               ;; 2. Does NOT have TICKTICK_PROJECT_ID (not a nested project)
+               (when (and (> level project-level)
+                          (not has-project-id))
+                 (setq task-count (1+ task-count))
+                 (message "TickTick:   Task #%d (level %d): %s" task-count level title)
+                 (if should-sync
+                     (let* ((task (ticktick-common-org-to-task))
+                            (id (ticktick-task-id task)))
+                       ;; Update task's project-id
+                       (setf (ticktick-task-project-id task) project-id)
+                       (message "TickTick:     Task ID: %s, Project ID: %s" 
+                                (or id "none") project-id)
+                       (if (and id (not (string-empty-p id)))
+                           (progn
+                             (message "TickTick:     Updating...")
+                             (let ((updated (ticktick-backend-update-task backend task id project-id)))
+                               (when updated
+                                 (when (ticktick-task-etag updated)
+                                   (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))))
+                             (ticktick-common-update-sync-meta)
+                             (setq updated-count (1+ updated-count))
+                             (message "TickTick:     ✓ Updated"))
+                         (message "TickTick:     Creating...")
+                         (let ((created (ticktick-backend-create-task backend task project-id)))
+                           (if created
+                               (progn
+                                 (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
+                                 (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
+                                 (ticktick-common-update-sync-meta)
+                                 (setq created-count (1+ created-count))
+                                 (message "TickTick:     ✓ Created (ID: %s)" (ticktick-task-id created)))
+                             (message "TickTick:     ✗ Failed to create")))))
+                   (setq skipped-count (1+ skipped-count))
+                   (message "TickTick:     Skipped (no changes)")))))
+           nil 'tree)))
+      
+      (message "TickTick:   Project summary: %d tasks, %d created, %d updated, %d skipped"
+               task-count created-count updated-count skipped-count)))))
+
+(defun ticktick--fetch-to-org-single-project (backend project-pos project-id)
+  "Fetch tasks for a single project at PROJECT-POS with PROJECT-ID."
+  (save-excursion
+    (goto-char project-pos)
+    (outline-show-subtree)
+    (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
+      (dolist (task tasks)
+        (ticktick--sync-task task project-pos)))))
+
 ;;;###autoload
 (defun ticktick-disable-autosync-on-blur ()
   "Disable automatic synchronization on window focus loss."
