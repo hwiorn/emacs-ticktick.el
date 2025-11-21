@@ -206,11 +206,17 @@ Return the buffer position at the start of the heading."
               (delete-region (org-entry-beginning-position)
                              (org-entry-end-position))
               (insert (ticktick-common-task-to-org task))
+              ;; Explicitly set the etag property after inserting the task
+              (when etag
+                (org-entry-put nil "TICKTICK_ETAG" etag))
               (ticktick-common-update-sync-meta))))
       (save-excursion
         (goto-char project-pos)
         (outline-next-heading)
         (insert (ticktick-common-task-to-org task) "\n")
+        ;; Explicitly set the etag property after inserting the task
+        (when etag
+          (org-entry-put nil "TICKTICK_ETAG" etag))
         (ticktick-common-update-sync-meta)))))
 
 (defun ticktick--sync-project (project backend)
@@ -307,24 +313,29 @@ Tries to match by ID first, then falls back to name-only matching if local ID is
                               (cdr (assoc project-name project-file-mapping))
                               fallback-file)))
 
-        (with-current-buffer (find-file-noselect target-file)
-          (org-with-wide-buffer
-           (let ((project-heading-pos (ticktick--find-project-heading project-name project-id)))
-             (if project-heading-pos
-                 (progn
-                   (goto-char project-heading-pos)
-                   (outline-show-subtree)
-                   (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
-                     (dolist (task tasks)
-                       (ticktick--sync-task task project-heading-pos))))
+        ;; Only sync to files that already have a project heading or are the fallback file
+        ;; AND only if the file is in our scan list or is the fallback
+        (when (or (string= target-file fallback-file)
+                  (member target-file (mapcar #'car (ticktick--scan-org-files-for-projects))))
+          (with-current-buffer (find-file-noselect target-file)
+            (org-with-wide-buffer
+             (let ((project-heading-pos (ticktick--find-project-heading project-name project-id)))
+               (if project-heading-pos
+                   ;; Project exists - update it
+                   (progn
+                     (goto-char project-heading-pos)
+                     (outline-show-subtree)
+                     (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
+                       (dolist (task tasks)
+                         (ticktick--sync-task task project-heading-pos))))
 
-               (when (or (string= target-file fallback-file)
-                         (ticktick--should-project-be-in-file-p project-name target-file))
-                 (let ((new-pos (ticktick--create-project-heading project)))
-                   (outline-show-subtree)
-                   (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
-                     (dolist (task tasks)
-                       (ticktick--sync-task task new-pos)))))))
+                 ;; Project doesn't exist - only create if fallback file
+                 (when (string= target-file fallback-file)
+                   (let ((new-pos (ticktick--create-project-heading project)))
+                     (outline-show-subtree)
+                     (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
+                       (dolist (task tasks)
+                         (ticktick--sync-task task new-pos))))))))
            (save-buffer)))))
     (message "Multi-file synchronization completed")))
 
@@ -332,10 +343,15 @@ Tries to match by ID first, then falls back to name-only matching if local ID is
 (defun ticktick-push-from-org ()
   "Push all updated org tasks back to TickTick."
   (interactive)
+  (message "DEBUG: ticktick-push-from-org called, multi-file=%s" ticktick-multi-file-support)
   (ticktick--ensure-backend)
   (if ticktick-multi-file-support
-      (ticktick--push-from-org-multi)
-    (ticktick--push-from-org-single)))
+      (progn
+        (message "DEBUG: Calling ticktick--push-from-org-multi")
+        (ticktick--push-from-org-multi))
+    (progn
+      (message "DEBUG: Calling ticktick--push-from-org-single")
+      (ticktick--push-from-org-single))))
 
 (defun ticktick--push-from-org-single ()
   "Push tasks from single org file."
@@ -364,7 +380,10 @@ Tries to match by ID first, then falls back to name-only matching if local ID is
                  (if (and id (not (string-empty-p id)))
                      (progn
                        (message "TickTick:   Updating task...")
-                       (ticktick-backend-update-task backend task id project-id)
+                       (let ((updated (ticktick-backend-update-task backend task id project-id)))
+                         (when updated
+                           (when (ticktick-task-etag updated)
+                             (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))))
                        (ticktick-common-update-sync-meta)
                        (setq updated-count (1+ updated-count))
                        (message "TickTick:   ✓ Updated: %s" (ticktick-task-title task)))
@@ -387,8 +406,10 @@ Tries to match by ID first, then falls back to name-only matching if local ID is
 
 (defun ticktick--push-from-org-multi ()
   "Push tasks from multiple org files."
+  (message "DEBUG: ticktick--push-from-org-multi CALLED")
   (let ((backend (ticktick--get-backend))
         (project-files (ticktick--scan-org-files-for-projects)))
+    (message "DEBUG: project-files = %S" project-files)
     (message "TickTick: Found %d files with projects" (length project-files))
     (dolist (file-info project-files)
       (let ((file-path (car file-info))
@@ -407,44 +428,57 @@ Tries to match by ID first, then falls back to name-only matching if local ID is
                          (created-count 0)
                          (updated-count 0)
                          (skipped-count 0))
-                     ;; Ensure point is at project heading for org-map-entries with 'tree scope
-                     ;; (ticktick--get-or-create-project-id may have moved point)
+                     ;; Process all subtasks under this project
+                     ;; Skip the project heading itself and only process descendants
                      (save-excursion
                        (goto-char pos)
-                       (org-map-entries
-                        (lambda ()
-                        (let ((level (org-current-level))
-                              (title (org-get-heading t t t t))
-                              (should-sync (ticktick-common-should-sync-p)))
-                          (when (> level 1)
-                            (setq task-count (1+ task-count))
-                            (message "TickTick:   Task #%d (level %d): %s" task-count level title)
-                            (if should-sync
-                                (let* ((task (ticktick-common-org-to-task))
-                                       (id (ticktick-task-id task)))
-                                  ;; Update task's project-id
-                                  (setf (ticktick-task-project-id task) project-id)
-                                  (message "TickTick:     Task ID: %s, Project ID: %s" (or id "none") project-id)
-                                  (if (and id (not (string-empty-p id)))
-                                      (progn
-                                        (message "TickTick:     Updating...")
-                                        (ticktick-backend-update-task backend task id project-id)
-                                        (ticktick-common-update-sync-meta)
-                                        (setq updated-count (1+ updated-count))
-                                        (message "TickTick:     ✓ Updated"))
-                                    (message "TickTick:     Creating...")
-                                    (let ((created (ticktick-backend-create-task backend task project-id)))
-                                      (if created
+                       (let ((project-level (org-current-level))
+                             (end-of-project (save-excursion
+                                               (goto-char pos)
+                                               (org-end-of-subtree t t))))
+                         ;; Use org-map-entries with a filter to skip the project itself
+                         (org-map-entries
+                          (lambda ()
+                            (let* ((level (org-current-level))
+                                   (title (org-get-heading t t t t))
+                                   (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
+                                   (should-sync (ticktick-common-should-sync-p)))
+                              ;; Only process if:
+                              ;; 1. Level is deeper than project level (not the project itself)
+                              ;; 2. Does NOT have TICKTICK_PROJECT_ID (not a nested project)
+                              (when (and (> level project-level)
+                                         (not has-project-id))
+                                (setq task-count (1+ task-count))
+                                (message "TickTick:   Task #%d (level %d): %s" task-count level title)
+                                (if should-sync
+                                    (let* ((task (ticktick-common-org-to-task))
+                                           (id (ticktick-task-id task)))
+                                      ;; Update task's project-id
+                                      (setf (ticktick-task-project-id task) project-id)
+                                      (message "TickTick:     Task ID: %s, Project ID: %s" (or id "none") project-id)
+                                      (if (and id (not (string-empty-p id)))
                                           (progn
-                                            (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
-                                            (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
+                                            (message "TickTick:     Updating...")
+                                            (let ((updated (ticktick-backend-update-task backend task id project-id)))
+                                              (when updated
+                                                (when (ticktick-task-etag updated)
+                                                  (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))))
                                             (ticktick-common-update-sync-meta)
-                                            (setq created-count (1+ created-count))
-                                            (message "TickTick:     ✓ Created (ID: %s)" (ticktick-task-id created)))
-                                        (message "TickTick:     ✗ Failed to create")))))
-                              (setq skipped-count (1+ skipped-count))
-                              (message "TickTick:     Skipped (no changes)")))))
-                        nil 'tree))
+                                            (setq updated-count (1+ updated-count))
+                                            (message "TickTick:     ✓ Updated"))
+                                        (message "TickTick:     Creating...")
+                                        (let ((created (ticktick-backend-create-task backend task project-id)))
+                                          (if created
+                                              (progn
+                                                (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
+                                                (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
+                                                (ticktick-common-update-sync-meta)
+                                                (setq created-count (1+ created-count))
+                                                (message "TickTick:     ✓ Created (ID: %s)" (ticktick-task-id created)))
+                                            (message "TickTick:     ✗ Failed to create")))))
+                                  (setq skipped-count (1+ skipped-count))
+                                  (message "TickTick:     Skipped (no changes)")))))
+                          nil 'tree)))
                      (message "TickTick:   Project summary: %d tasks, %d created, %d updated, %d skipped"
                               task-count created-count updated-count skipped-count))))))
            (save-buffer)))))
@@ -454,10 +488,16 @@ Tries to match by ID first, then falls back to name-only matching if local ID is
 (defun ticktick-sync ()
   "Two-way sync: push local changes first, then fetch remote updates."
   (interactive)
+  (message "DEBUG: === ticktick-sync CALLED ===")
+  (message "DEBUG: ticktick-multi-file-support = %s" ticktick-multi-file-support)
   (ticktick--ensure-backend)
+  (message "DEBUG: Calling ticktick-push-from-org...")
   (ticktick-push-from-org)
+  (message "DEBUG: Calling sit-for...")
   (sit-for 1)
-  (ticktick-fetch-to-org))
+  (message "DEBUG: Calling ticktick-fetch-to-org...")
+  (ticktick-fetch-to-org)
+  (message "DEBUG: === ticktick-sync DONE ==="))
 
 ;;; Utility/Admin Commands ---------------------------------------------------
 

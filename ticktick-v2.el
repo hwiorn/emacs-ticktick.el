@@ -74,6 +74,16 @@ When syncing >= this many tasks, use batch endpoint for efficiency."
   :type 'file
   :group 'ticktick)
 
+;;; Utility Functions --------------------------------------------------------
+
+(defun ticktick-v2--generate-object-id ()
+  "Generate a MongoDB-style ObjectId (24 hex characters).
+Format: 8-char timestamp + 5-char random + 3-char counter"
+  (let* ((timestamp (format "%08x" (truncate (float-time))))
+         (random-part (format "%010x" (random (expt 16 10))))
+         (counter (format "%06x" (random (expt 16 6)))))
+    (concat timestamp (substring random-part 0 10) (substring counter 0 6))))
+
 ;;; V2 Constants -------------------------------------------------------------
 
 (defconst ticktick-v2-user-agent
@@ -424,21 +434,31 @@ SKIP-TOKEN-CHECK skips the token validation (used for retry after re-auth)."
    :created-time (plist-get v2-task :createdTime)
    :modified-time (plist-get v2-task :modifiedTime)))
 
-(defun ticktick-v2--internal-to-api-task (task)
-  "Convert internal TASK structure to V2 API format (alist)."
+(defun ticktick-v2--internal-to-api-task (task &optional for-creation)
+  "Convert internal TASK structure to V2 API format (alist).
+If FOR-CREATION is non-nil, generate a new ID for tasks without one."
   (let ((alist '()))
-    (when-let ((id (ticktick-task-id task)))
-      (push (cons "id" id) alist))
-    (when-let ((title (ticktick-task-title task)))
-      (push (cons "title" title) alist))
+    ;; ID: Required - generate if creating and no ID exists
+    (let ((id (ticktick-task-id task)))
+      (when (or id for-creation)
+        (push (cons "id" (or id (ticktick-v2--generate-object-id))) alist)))
+
+    ;; Title: Required for V2 API
+    (let ((title (ticktick-task-title task)))
+      (push (cons "title" (or title "Untitled")) alist))
+
+    ;; Status: Always include
     (push (cons "status" (ticktick-v2--internal-to-status (ticktick-task-status task)))
           alist)
+
+    ;; Optional fields
     (when-let ((priority (ticktick-task-priority task)))
       (push (cons "priority" priority) alist))
     (when-let ((due-date (ticktick-task-due-date task)))
       (push (cons "dueDate" due-date) alist))
     (when-let ((content (ticktick-task-content task)))
       (push (cons "content" content) alist))
+
     (nreverse alist)))
 
 (defun ticktick-v2--project-to-internal (v2-project)
@@ -450,13 +470,24 @@ SKIP-TOKEN-CHECK skips the token validation (used for retry after re-auth)."
    :view-mode (plist-get v2-project :viewMode)
    :kind (plist-get v2-project :kind)))
 
-(defun ticktick-v2--internal-to-api-project (project)
-  "Convert internal PROJECT structure to V2 API format (alist)."
+(defun ticktick-v2--internal-to-api-project (project &optional for-creation)
+  "Convert internal PROJECT structure to V2 API format (alist).
+If FOR-CREATION is non-nil, generate a new ID for projects without one."
   (let ((alist '()))
-    (when-let ((id (ticktick-project-id project)))
-      (push (cons "id" id) alist))
-    (when-let ((name (ticktick-project-name project)))
-      (push (cons "name" name) alist))
+    ;; ID: Required - generate if creating and no ID exists
+    (let ((id (ticktick-project-id project)))
+      (when (or id for-creation)
+        (let ((project-id (or id (ticktick-v2--generate-object-id))))
+          (push (cons "id" project-id) alist)
+          ;; Store the generated ID back in the project
+          (when (and for-creation (not id))
+            (setf (ticktick-project-id project) project-id)))))
+
+    ;; Name: Required
+    (let ((name (ticktick-project-name project)))
+      (push (cons "name" (or name "Untitled")) alist))
+
+    ;; Optional fields
     (when-let ((color (ticktick-project-color project)))
       (push (cons "color" color) alist))
     (when-let ((view-mode (ticktick-project-view-mode project)))
@@ -531,20 +562,26 @@ Returns a plist with :id2etag (successes) and :id2error (failures)."
 
 (cl-defmethod ticktick-backend-create-task ((backend ticktick-v2-backend) task project-id)
   "Create TASK in PROJECT-ID using V2 API."
-  (let* ((api-task (ticktick-v2--internal-to-api-task task))
+  (let* ((api-task (ticktick-v2--internal-to-api-task task t))  ; t = for-creation
            (api-task-with-project (append api-task `(("projectId" . ,project-id))))
            (response (ticktick-v2-batch-task backend
                                          `(:add (,api-task-with-project)))))
     (when response
+      (message "V2: Create task response: %S" response)
       (let ((id2etag (plist-get response :id2etag)))
+        (message "V2: id2etag: %S" id2etag)
         (when id2etag
           ;; For newly created task, get the first (and only) id from id2etag
-          ;; id2etag is an alist: (("task-id" . "etag") ...)
-          (let* ((first-entry (car id2etag))
-                 (new-task-id (when (consp first-entry) (car first-entry)))
-                 (new-etag (when (consp first-entry) (cdr first-entry))))
-            (when new-task-id
-              (setf (ticktick-task-id task) new-task-id)
+          ;; id2etag is a plist with keyword keys: (:task-id "etag" ...)
+          ;; Get the generated ID from api-task
+          (let* ((generated-id (cdr (assoc "id" api-task)))
+                 ;; Convert string ID to keyword for plist lookup
+                 (id-keyword (intern (concat ":" generated-id)))
+                 (new-etag (plist-get id2etag id-keyword)))
+            (message "V2: generated-id=%s, id-keyword=%s, new-etag=%s"
+                     generated-id id-keyword new-etag)
+            (when generated-id
+              (setf (ticktick-task-id task) generated-id)
               (setf (ticktick-task-etag task) new-etag)
               task)))))))
 
@@ -559,9 +596,11 @@ Returns a plist with :id2etag (successes) and :id2error (failures)."
     (when response
       (let ((id2etag (plist-get response :id2etag)))
         (when id2etag
-          (setf (ticktick-task-etag task)
-                (plist-get id2etag (intern task-id)))
-          task)))))
+          ;; Convert string ID to keyword for plist lookup
+          (let ((id-keyword (intern (concat ":" task-id))))
+            (setf (ticktick-task-etag task)
+                  (plist-get id2etag id-keyword))
+            task))))))
 
 (cl-defmethod ticktick-backend-delete-task ((backend ticktick-v2-backend) task-id project-id)
   "Delete task TASK-ID from PROJECT-ID using V2 API."
@@ -572,11 +611,12 @@ Returns a plist with :id2etag (successes) and :id2error (failures)."
 
 (cl-defmethod ticktick-backend-create-project ((backend ticktick-v2-backend) project)
   "Create PROJECT using V2 API."
-  (let* ((api-project (ticktick-v2--internal-to-api-project project))
+  (let* ((api-project (ticktick-v2--internal-to-api-project project t))  ; t = for-creation
            (response (ticktick-v2-request backend "POST" "/batch/project"
                                       `(("add" . (,api-project))))))
     (when response
-      ;; V2 batch returns id2etag, we need to extract the created project
+      ;; The project object now has the generated ID from internal-to-api-project
+      ;; Return the project with the ID
       project)))
 
 (cl-defmethod ticktick-backend-update-project ((backend ticktick-v2-backend) project project-id)
