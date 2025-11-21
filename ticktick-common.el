@@ -51,6 +51,7 @@
   content      ; Task description/content (string or nil)
   etag         ; ETag for conflict detection (string or nil)
   project-id   ; Parent project ID (string)
+  sort-order   ; Sort order (integer or nil)
   tags         ; List of tag strings
   kind         ; Task kind (V2 only): TEXT, NOTE, CHECKLIST
   created-time ; Creation timestamp (datetime string or nil)
@@ -133,6 +134,7 @@ Returns a `ticktick-task' struct."
          (id (org-entry-get nil "TICKTICK_ID"))
          (etag (org-entry-get nil "TICKTICK_ETAG"))
          (project-id (org-entry-get nil "TICKTICK_PROJECT_ID" t))
+         (sort-order (org-entry-get nil "TICKTICK_SORT_ORDER"))
          (tags (org-get-tags))
          (content (ticktick-common--extract-content)))
     (ticktick-task-create
@@ -146,6 +148,7 @@ Returns a `ticktick-task' struct."
      :content content
      :etag etag
      :project-id project-id
+     :sort-order (when sort-order (string-to-number sort-order))
      :tags tags
      :kind "TEXT"  ; Default to TEXT, backends may override
      :created-time nil
@@ -180,7 +183,8 @@ Returns a formatted org heading with properties."
         (priority (ticktick-task-priority task))
         (due-date (ticktick-task-due-date task))
         (etag (ticktick-task-etag task))
-        (content (ticktick-task-content task)))
+        (content (ticktick-task-content task))
+        (sort-order (ticktick-task-sort-order task)))
     (string-join
      (delq nil
            (list
@@ -200,6 +204,7 @@ Returns a formatted org heading with properties."
             ":PROPERTIES:"
             (when id (format ":TICKTICK_ID: %s" id))
             (when etag (format ":TICKTICK_ETAG: %s" etag))
+            (when sort-order (format ":TICKTICK_SORT_ORDER: %s" sort-order))
             ":END:"
             ;; Content
             (when content (string-trim content))))
@@ -287,7 +292,7 @@ If TIME-STRING is nil, returns nil."
 If TIME-STRING is nil, returns nil."
   (when (and time-string (not (string-empty-p time-string)))
     (condition-case nil
-        (date-to-time time-string)
+(date-to-time time-string)
       (error nil))))
 
 (provide 'ticktick-common)

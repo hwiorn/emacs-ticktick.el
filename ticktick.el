@@ -1365,6 +1365,108 @@ This only pushes local changes (push direction) and does not fetch remote update
       (dolist (task tasks)
         (ticktick--sync-task task project-pos)))))
 
+;;; Task Ordering Functions -----------------------------------------------
+
+;;;###autoload
+(defun ticktick-set-task-sort-order ()
+  "Set sort order for current task.
+This allows manual control of task ordering in TickTick V2.
+The sort order is an integer where lower numbers appear higher in the list."
+  (interactive)
+  (unless (eq major-mode 'org-mode)
+    (user-error "Current buffer is not in org-mode"))
+  
+  (unless (org-entry-get nil "TICKTICK_ID")
+    (user-error "No TICKTICK_ID found at current heading"))
+  
+  (let* ((current-sort-order (org-entry-get nil "TICKTICK_SORT_ORDER"))
+         (new-order (read-number (format "Sort order (current: %s): " 
+                                        (or current-sort-order "not set")))))
+    (org-entry-put nil "TICKTICK_SORT_ORDER" (number-to-string new-order))
+    (message "Task sort order set to: %d" new-order)))
+
+;;;###autoload
+(defun ticktick-move-task-up ()
+  "Move current task up in sort order.
+Decreases the sort order value by 1."
+  (interactive)
+  (unless (eq major-mode 'org-mode)
+    (user-error "Current buffer is not in org-mode"))
+  
+  (unless (org-entry-get nil "TICKTICK_ID")
+    (user-error "No TICKTICK_ID found at current heading"))
+  
+  (let* ((current-sort-order (org-entry-get nil "TICKTICK_SORT_ORDER"))
+         (current-value (if current-sort-order (string-to-number current-sort-order) 0)))
+    (if (> current-value 0)
+        (progn
+          (org-entry-put nil "TICKTICK_SORT_ORDER" (number-to-string (1- current-value)))
+          (message "Task moved up - new sort order: %d" (1- current-value)))
+      (message "Task is already at the top (sort order: %d)" current-value))))
+
+;;;###autoload
+(defun ticktick-move-task-down ()
+  "Move current task down in sort order.
+Increases the sort order value by 1."
+  (interactive)
+  (unless (eq major-mode 'org-mode)
+    (user-error "Current buffer is not in org-mode"))
+  
+  (unless (org-entry-get nil "TICKTICK_ID")
+    (user-error "No TICKTICK_ID found at current heading"))
+  
+  (let* ((current-sort-order (org-entry-get nil "TICKTICK_SORT_ORDER"))
+         (current-value (if current-sort-order (string-to-number current-sort-order) 0)))
+    (org-entry-put nil "TICKTICK_SORT_ORDER" (number-to-string (1+ current-value)))
+    (message "Task moved down - new sort order: %d" (1+ current-value))))
+
+;;;###autoload
+(defun ticktick-reset-project-sort-order ()
+  "Reset sort order for all tasks in current project.
+Sets sequential sort order starting from 0 based on current org order."
+  (interactive)
+  (unless (eq major-mode 'org-mode)
+    (user-error "Current buffer is not in org-mode"))
+  
+  ;; Find project containing current position
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((project-pos nil)
+          (project-level nil))
+      
+      ;; Find parent project (level 1 heading with project detection)
+      (while (and (org-up-heading-safe)
+                  (> (org-current-level) 1)))
+      
+      (when (= (org-current-level) 1)
+        (setq project-pos (point))
+        (setq project-level (org-current-level)))
+      
+      (unless (and project-pos (funcall ticktick-project-detection-function))
+        (user-error "No project found at current position"))
+      
+      (message "Resetting sort order for project...")
+      (let ((task-count 0))
+        (save-excursion
+          (goto-char project-pos)
+          (let ((end-of-project (save-excursion
+                                (goto-char project-pos)
+                                (org-end-of-subtree t t))))
+            (goto-char project-pos)
+            (org-map-entries
+             (lambda ()
+               (let* ((level (org-current-level))
+                      (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
+                 ;; Only process tasks (not nested projects)
+                 (when (and (> level project-level)
+                            (not has-project-id)
+                            (org-entry-get nil "TICKTICK_ID"))
+                   (setq task-count (1+ task-count))
+                   (org-entry-put nil "TICKTICK_SORT_ORDER" (number-to-string task-count))
+                   (message "  Task %d: sort order set to %d" task-count task-count))))
+             nil 'tree)))
+        (message "Sort order reset for %d tasks in project" task-count)))))
+
 ;;;###autoload
 (defun ticktick-disable-autosync-on-blur ()
   "Disable automatic synchronization on window focus loss."

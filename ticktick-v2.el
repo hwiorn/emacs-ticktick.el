@@ -429,6 +429,7 @@ SKIP-TOKEN-CHECK skips the token validation (used for retry after re-auth)."
                 (plist-get v2-task :desc))
    :etag (plist-get v2-task :etag)
    :project-id (plist-get v2-task :projectId)
+   :sort-order (plist-get v2-task :sortOrder)
    :tags (plist-get v2-task :tags)
    :kind (or (plist-get v2-task :kind) "TEXT")
    :created-time (plist-get v2-task :createdTime)
@@ -458,6 +459,9 @@ If FOR-CREATION is non-nil, generate a new ID for tasks without one."
       (push (cons "dueDate" due-date) alist))
     (when-let ((content (ticktick-task-content task)))
       (push (cons "content" content) alist))
+    (let ((sort-order (ticktick-task-sort-order task)))
+      (when sort-order
+        (push (cons "sortOrder" sort-order) alist)))
 
     (nreverse alist)))
 
