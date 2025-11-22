@@ -178,7 +178,8 @@ Returns a `ticktick-task' struct."
      :priority (ticktick-common-org-priority-to-number priority-char)
      :due-date (when deadline
                  (format-time-string "%Y-%m-%dT%H:%M:%S+0000"
-                                     (org-timestamp-to-time deadline)))
+                                     (org-timestamp-to-time deadline)
+                                     t))  ; t = convert to UTC
      :content content
      :etag etag
      :project-id project-id
@@ -189,7 +190,8 @@ Returns a `ticktick-task' struct."
      :modified-time nil
      :completed-time (when closed
                        (format-time-string "%Y-%m-%dT%H:%M:%S+0000"
-                                           (org-timestamp-to-time closed))))))
+                                           (org-timestamp-to-time closed)
+                                           t)))))
 
 (defun ticktick-common--extract-content ()
   "Extract content/description from current org subtree.
