@@ -37,6 +37,24 @@
 (require 'cl-lib)
 (require 'subr-x)
 
+;;; Customization Variables --------------------------------------------------
+
+(defcustom ticktick-sync-sort-order 'push-only
+  "How to sync task order between org-mode and TickTick.
+- 'push-only: Assign sort-order based on org heading order when pushing to TickTick
+- 'bidirectional: Also reorder org headings based on TickTick sort-order when fetching
+- nil: Don't sync sort-order automatically (manual management only)"
+  :type '(choice (const :tag "Push org order to TickTick" push-only)
+                 (const :tag "Sync both ways" bidirectional)
+                 (const :tag "Manual only" nil))
+  :group 'ticktick)
+
+(defcustom ticktick-cancelled-keywords '("CANCELLED" "KILL" "CNCL")
+  "List of org TODO keywords that map to TickTick's cancelled status.
+These keywords will be synced as 'won\\'t do' (계획취소) status in TickTick."
+  :type '(repeat string)
+  :group 'ticktick)
+
 ;;; Internal Data Structures -------------------------------------------------
 
 (cl-defstruct (ticktick-task
@@ -56,6 +74,7 @@
   kind         ; Task kind (V2 only): TEXT, NOTE, CHECKLIST
   created-time ; Creation timestamp (datetime string or nil)
   modified-time ; Last modification timestamp (datetime string or nil)
+  completed-time ; Completion timestamp (datetime string or nil)
   )
 
 (cl-defstruct (ticktick-project
@@ -83,10 +102,10 @@
 (defun ticktick-common-org-status-to-internal (todo-type todo-keyword)
   "Convert org TODO-TYPE and TODO-KEYWORD to internal status symbol.
 TODO-TYPE is 'todo or 'done from `org-element-property'.
-TODO-KEYWORD is the actual keyword string like 'TODO', 'DONE', 'CANCELLED'."
+TODO-KEYWORD is the actual keyword string like 'TODO', 'DONE', 'CANCELLED', 'KILL', etc."
   (cond
    ((eq todo-type 'done)
-    (if (and todo-keyword (string= todo-keyword "CANCELLED"))
+    (if (and todo-keyword (member todo-keyword ticktick-cancelled-keywords))
         ticktick-status-cancelled
       ticktick-status-completed))
    (t ticktick-status-active)))
@@ -131,16 +150,31 @@ Returns a `ticktick-task' struct."
          (todo-keyword (org-element-property :todo-keyword el))
          (priority-char (org-element-property :priority el))
          (deadline (org-element-property :deadline el))
+         (closed (org-element-property :closed el))
          (id (org-entry-get nil "TICKTICK_ID"))
          (etag (org-entry-get nil "TICKTICK_ETAG"))
          (project-id (org-entry-get nil "TICKTICK_PROJECT_ID" t))
          (sort-order (org-entry-get nil "TICKTICK_SORT_ORDER"))
          (tags (org-get-tags))
-         (content (ticktick-common--extract-content)))
+         (content (ticktick-common--extract-content))
+         ;; Extract TODO keyword directly from heading text as fallback
+         (heading-text (save-excursion (org-back-to-heading t) (org-get-heading t)))
+         (extracted-keyword (when (string-match "^\\(TODO\\|DONE\\|NEXT\\|WAITING\\|HOLD\\|CANCELLED\\|KILL\\|CNCL\\|SOMEDAY\\) " heading-text)
+                              (match-string 1 heading-text)))
+         ;; Use extracted keyword if org-element didn't recognize it
+         (final-keyword (or todo-keyword extracted-keyword))
+         ;; Determine type: if keyword is in cancelled list or DONE, it's done type
+         (final-type (cond
+                      ((member final-keyword ticktick-cancelled-keywords) 'done)
+                      ((member final-keyword '("DONE")) 'done)
+                      (todo-type todo-type)
+                      (final-keyword 'todo)
+                      (t nil)))
+         (internal-status (ticktick-common-org-status-to-internal final-type final-keyword)))
     (ticktick-task-create
      :id id
      :title title
-     :status (ticktick-common-org-status-to-internal todo-type todo-keyword)
+     :status internal-status
      :priority (ticktick-common-org-priority-to-number priority-char)
      :due-date (when deadline
                  (format-time-string "%Y-%m-%dT%H:%M:%S+0000"
@@ -152,7 +186,10 @@ Returns a `ticktick-task' struct."
      :tags tags
      :kind "TEXT"  ; Default to TEXT, backends may override
      :created-time nil
-     :modified-time nil)))
+     :modified-time nil
+     :completed-time (when closed
+                       (format-time-string "%Y-%m-%dT%H:%M:%S+0000"
+                                           (org-timestamp-to-time closed))))))
 
 (defun ticktick-common--extract-content ()
   "Extract content/description from current org subtree.

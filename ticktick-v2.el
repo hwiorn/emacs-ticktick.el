@@ -433,12 +433,15 @@ SKIP-TOKEN-CHECK skips the token validation (used for retry after re-auth)."
    :tags (plist-get v2-task :tags)
    :kind (or (plist-get v2-task :kind) "TEXT")
    :created-time (plist-get v2-task :createdTime)
-   :modified-time (plist-get v2-task :modifiedTime)))
+   :modified-time (plist-get v2-task :modifiedTime)
+   :completed-time (plist-get v2-task :completedTime)))
 
 (defun ticktick-v2--internal-to-api-task (task &optional for-creation)
   "Convert internal TASK structure to V2 API format (alist).
 If FOR-CREATION is non-nil, generate a new ID for tasks without one."
-  (let ((alist '()))
+  (let ((alist '())
+        (internal-status (ticktick-task-status task))
+        (api-status (ticktick-v2--internal-to-status (ticktick-task-status task))))
     ;; ID: Required - generate if creating and no ID exists
     (let ((id (ticktick-task-id task)))
       (when (or id for-creation)
@@ -449,8 +452,7 @@ If FOR-CREATION is non-nil, generate a new ID for tasks without one."
       (push (cons "title" (or title "Untitled")) alist))
 
     ;; Status: Always include
-    (push (cons "status" (ticktick-v2--internal-to-status (ticktick-task-status task)))
-          alist)
+    (push (cons "status" api-status) alist)
 
     ;; Optional fields
     (when-let ((priority (ticktick-task-priority task)))
@@ -462,6 +464,8 @@ If FOR-CREATION is non-nil, generate a new ID for tasks without one."
     (let ((sort-order (ticktick-task-sort-order task)))
       (when sort-order
         (push (cons "sortOrder" sort-order) alist)))
+    (when-let ((completed-time (ticktick-task-completed-time task)))
+      (push (cons "completedTime" completed-time) alist))
 
     (nreverse alist)))
 
