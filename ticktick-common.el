@@ -251,11 +251,30 @@ Returns a formatted org heading with properties."
 
 ;;; Org <-> Internal Project Conversion --------------------------------------
 
+(defun ticktick-common--strip-statistics-cookie (heading)
+  "Remove statistics cookies like [1/10] or [33%] from HEADING.
+Preserves the rest of the heading text."
+  (replace-regexp-in-string " *\\[[0-9]+/[0-9]+\\]\\| *\\[[0-9]+%\\]" "" heading))
+
+(defun ticktick-common--sanitize-project-name (name)
+  "Sanitize project NAME for TickTick by removing invalid characters.
+TickTick does not allow these characters in project names: \\ / \" : * ? < > |
+Also removes statistics cookies like [1/10] or [33%]."
+  (let ((sanitized name))
+    ;; First remove statistics cookies
+    (setq sanitized (ticktick-common--strip-statistics-cookie sanitized))
+    ;; Remove invalid characters: \ / " : * ? < > |
+    (setq sanitized (replace-regexp-in-string "[\\\\/:\"*?<>|]" "" sanitized))
+    ;; Trim whitespace
+    (string-trim sanitized)))
+
 (defun ticktick-common-org-to-project ()
   "Convert org heading at point to internal project structure.
 Returns a `ticktick-project' struct."
   (let* ((el (org-element-at-point))
-         (name (org-element-property :raw-value el))
+         (raw-name (org-element-property :raw-value el))
+         ;; Sanitize name: remove statistics cookies and invalid characters
+         (name (ticktick-common--sanitize-project-name raw-name))
          (id (org-entry-get nil "TICKTICK_PROJECT_ID"))
          (color (org-entry-get nil "TICKTICK_PROJECT_COLOR"))
          (view-mode (org-entry-get nil "TICKTICK_PROJECT_VIEWMODE"))
@@ -267,16 +286,20 @@ Returns a `ticktick-project' struct."
      :view-mode (or view-mode "list")
      :kind (or kind "TASK"))))
 
-(defun ticktick-common-project-to-org (project)
+(defun ticktick-common-project-to-org (project &optional preserve-heading)
   "Convert internal PROJECT structure to org heading string.
-Returns a formatted org heading with properties."
+Returns a formatted org heading with properties.
+If PRESERVE-HEADING is non-nil, use it instead of project name to preserve
+org statistics cookies and other heading decorations."
   (let ((id (ticktick-project-id project))
         (name (ticktick-project-name project))
         (color (ticktick-project-color project))
         (view-mode (ticktick-project-view-mode project))
-        (kind (ticktick-project-kind project)))
+        (kind (ticktick-project-kind project))
+        ;; Use preserved heading if provided, otherwise use project name
+        (heading-text (or preserve-heading name)))
     (format "* %s\n:PROPERTIES:\n:TICKTICK_PROJECT_ID: %s\n:TICKTICK_PROJECT_COLOR: %s\n:TICKTICK_PROJECT_VIEWMODE: %s\n:TICKTICK_PROJECT_KIND: %s\n:END:\n"
-            name
+            heading-text
             (or id "")
             (or color "#F18181")
             (or view-mode "list")

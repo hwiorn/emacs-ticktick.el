@@ -265,17 +265,20 @@ Only sorts when `ticktick-sync-sort-order' is 'bidirectional."
             (insert (cdr task-data))))))))
 
 (defun ticktick--sync-project (project backend)
-  "Sync a single PROJECT (internal struct) using BACKEND."
+  "Sync a single PROJECT (internal struct) using BACKEND.
+Updates project properties but preserves the original org heading text."
   (let* ((project-id (ticktick-project-id project))
          (project-title (ticktick-project-name project))
-         (project-heading-re (format "^\\* %s$" (regexp-quote project-title)))
-         (project-pos (save-excursion
-                        (goto-char (point-min))
-                        (when (re-search-forward project-heading-re nil t)
-                          (match-beginning 0)))))
+         (project-pos (ticktick--find-project-heading project-title project-id)))
     (unless project-pos
       (setq project-pos (ticktick--create-project-heading project)))
     (goto-char project-pos)
+    ;; Update project properties (color, view-mode, kind) but preserve heading
+    (when project-pos
+      (org-entry-put nil "TICKTICK_PROJECT_ID" project-id)
+      (org-entry-put nil "TICKTICK_PROJECT_COLOR" (ticktick-project-color project))
+      (org-entry-put nil "TICKTICK_PROJECT_VIEWMODE" (ticktick-project-view-mode project))
+      (org-entry-put nil "TICKTICK_PROJECT_KIND" (ticktick-project-kind project)))
     (outline-show-subtree)
     (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
       (dolist (task tasks)
@@ -298,25 +301,36 @@ Only sorts when `ticktick-sync-sort-order' is 'bidirectional."
 (defun ticktick--find-project-heading (project-name project-id)
   "Find existing project heading by name or ID.
 Returns buffer position if found, nil otherwise.
-Tries to match by ID first, then falls back to name-only matching if local ID is empty."
+Tries to match by ID first, then falls back to name-only matching.
+Sanitizes project names when matching (removes cookies and invalid chars)."
   (save-excursion
     (goto-char (point-min))
-    (let ((name-regex (format "^\\* %s$" (regexp-quote project-name)))
-          (found-pos nil))
-      (while (and (not found-pos) (re-search-forward name-regex nil t))
-        (let ((pos (match-beginning 0)))
-          (save-excursion
-            (goto-char pos)
-            (let ((local-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
-              ;; Match if:
-              ;; 1. No project-id provided (name-only search), OR
-              ;; 2. Local ID is nil or empty (match by name), OR
-              ;; 3. IDs match exactly
-              (when (or (not project-id)
-                       (not local-id)
-                       (string-empty-p local-id)
-                       (string= local-id project-id))
-                (setq found-pos pos))))))
+    ;; First try to find by ID (most reliable)
+    (let ((found-pos nil))
+      (when project-id
+        (while (and (not found-pos) (outline-next-heading))
+          (when (and (= (org-current-level) 1)
+                     (string= (org-entry-get nil "TICKTICK_PROJECT_ID") project-id))
+            (setq found-pos (point)))))
+      ;; If not found by ID, try by name (sanitize for comparison)
+      (unless found-pos
+        (goto-char (point-min))
+        (let ((sanitized-name (ticktick-common--sanitize-project-name project-name)))
+          (while (and (not found-pos) (outline-next-heading))
+            (when (= (org-current-level) 1)
+              (let* ((local-heading (org-get-heading t t t t))
+                     (local-sanitized (ticktick-common--sanitize-project-name local-heading))
+                     (local-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
+                ;; Match if names match (after sanitizing) AND:
+                ;; 1. No project-id provided (name-only search), OR
+                ;; 2. Local ID is nil or empty (match by name), OR
+                ;; 3. IDs match exactly
+                (when (and (string= local-sanitized sanitized-name)
+                          (or (not project-id)
+                              (not local-id)
+                              (string-empty-p local-id)
+                              (string= local-id project-id)))
+                  (setq found-pos (point))))))))
       found-pos)))
 
 ;;; Main Sync Functions ------------------------------------------------------
@@ -839,12 +853,14 @@ Returns non-nil if the heading has ORG_GTD property set to \"Projects\"."
   (org-get-heading t t))
 
 (defun ticktick--get-or-create-project-id (project-name backend)
-  "Get existing project ID or create new project with PROJECT-NAME using BACKEND."
+  "Get existing project ID or create new project with PROJECT-NAME using BACKEND.
+Sanitizes project name by removing statistics cookies and invalid characters."
   (let ((existing-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
     (if (and existing-id (not (string-empty-p existing-id)))
         existing-id
-      (let* ((project (ticktick-project-create
-                       :name project-name
+      (let* ((sanitized-name (ticktick-common--sanitize-project-name project-name))
+             (project (ticktick-project-create
+                       :name sanitized-name
                        :color "#F18181"
                        :view-mode "list"
                        :kind "TASK"))
