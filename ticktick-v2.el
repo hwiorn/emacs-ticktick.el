@@ -463,11 +463,14 @@ If FOR-CREATION is non-nil, generate a new ID for tasks without one."
       (push (cons "content" content) alist))
     (let ((sort-order (ticktick-task-sort-order task)))
       (when sort-order
+        (message "V2 DEBUG: Adding sortOrder=%s for task: %s" sort-order (ticktick-task-title task))
         (push (cons "sortOrder" sort-order) alist)))
     (when-let ((completed-time (ticktick-task-completed-time task)))
       (push (cons "completedTime" completed-time) alist))
 
-    (nreverse alist)))
+    (let ((result (nreverse alist)))
+      (message "V2 DEBUG: Final API task alist: %S" result)
+      result)))
 
 (defun ticktick-v2--project-to-internal (v2-project)
   "Convert V2 API project plist to internal project structure."

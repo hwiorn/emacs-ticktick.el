@@ -156,6 +156,8 @@ Returns a `ticktick-task' struct."
          (project-id (org-entry-get nil "TICKTICK_PROJECT_ID" t))
          (sort-order (org-entry-get nil "TICKTICK_SORT_ORDER"))
          (tags (org-get-tags))
+         (_ (message "TickTick: DEBUG org-to-task: title='%s' existing-sortOrder=%s"
+                     (org-element-property :raw-value el) sort-order))
          (content (ticktick-common--extract-content))
          ;; Extract TODO keyword directly from heading text as fallback
          (heading-text (save-excursion (org-back-to-heading t) (org-get-heading t)))

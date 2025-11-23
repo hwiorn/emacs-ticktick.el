@@ -197,72 +197,126 @@ Return the buffer position at the start of the heading."
   "Sync a single TASK (internal struct) under PROJECT-POS."
   (let* ((id (ticktick-task-id task))
          (etag (ticktick-task-etag task))
+         (sort-order (ticktick-task-sort-order task))
          (existing-pos (ticktick--find-task-under-project project-pos id)))
     (if existing-pos
         (save-excursion
           (goto-char existing-pos)
-          (let ((existing-etag (org-entry-get nil "TICKTICK_ETAG")))
-            (unless (and etag existing-etag (string= existing-etag etag))
+          (let ((existing-etag (org-entry-get nil "TICKTICK_ETAG"))
+                (existing-sort-order (org-entry-get nil "TICKTICK_SORT_ORDER")))
+            ;; Update if etag changed OR sortOrder changed
+            (unless (and etag existing-etag (string= existing-etag etag)
+                         (or (not sort-order)
+                             (and existing-sort-order
+                                  (= sort-order (string-to-number existing-sort-order)))))
               (delete-region (org-entry-beginning-position)
                              (org-entry-end-position))
               (insert (ticktick-common-task-to-org task))
-              ;; Explicitly set the etag property after inserting the task
+              ;; Explicitly set the etag and sort-order properties after inserting
               (when etag
                 (org-entry-put nil "TICKTICK_ETAG" etag))
+              (when sort-order
+                (org-entry-put nil "TICKTICK_SORT_ORDER" (number-to-string sort-order)))
               (ticktick-common-update-sync-meta))))
       (save-excursion
         (goto-char project-pos)
         (outline-next-heading)
         (insert (ticktick-common-task-to-org task) "\n")
-        ;; Explicitly set the etag property after inserting the task
+        ;; Explicitly set the etag and sort-order properties after inserting
         (when etag
           (org-entry-put nil "TICKTICK_ETAG" etag))
+        (when sort-order
+          (org-entry-put nil "TICKTICK_SORT_ORDER" (number-to-string sort-order)))
         (ticktick-common-update-sync-meta)))))
 
-(defun ticktick--sort-tasks-by-sort-order (project-pos)
+(defun ticktick--sort-tasks-by-sort-order (project-pos &optional force)
   "Sort all tasks under PROJECT-POS by their TICKTICK_SORT_ORDER property.
-Only sorts when `ticktick-sync-sort-order' is 'bidirectional."
-  (when (eq ticktick-sync-sort-order 'bidirectional)
+Only sorts when `ticktick-sync-sort-order' is 'bidirectional, unless FORCE is non-nil."
+  (when (or force (eq ticktick-sync-sort-order 'bidirectional))
     (save-excursion
       (goto-char project-pos)
       (let ((project-level (org-current-level))
             (tasks-data '()))
         ;; Collect all tasks under this project with their sort-order
+        (message "TickTick: DEBUG: Collecting tasks for sorting...")
         (org-map-entries
          (lambda ()
            (let* ((level (org-current-level))
                   (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
-                  (sort-order-str (org-entry-get nil "TICKTICK_SORT_ORDER")))
+                  (sort-order-str (org-entry-get nil "TICKTICK_SORT_ORDER"))
+                  (title (org-get-heading t t t t)))
+             (message "TickTick: DEBUG:   Task '%s': level=%d, has-proj-id=%s, sort-order=%s"
+                      title level has-project-id sort-order-str)
              (when (and (> level project-level)
                         (not has-project-id)
                         sort-order-str)
+               (message "TickTick: DEBUG:     -> Will sort this task")
                (push (cons (string-to-number sort-order-str)
                            (buffer-substring-no-properties
                             (org-entry-beginning-position)
                             (org-entry-end-position)))
                      tasks-data))))
          nil 'tree)
-        ;; Sort by sort-order (ascending)
+        (message "TickTick: DEBUG: Collected %d tasks to sort" (length tasks-data))
+        ;; Remove duplicates based on TICKTICK_ID (keep the first occurrence)
+        (let ((seen-ids (make-hash-table :test 'equal))
+              (unique-tasks '()))
+          (dolist (task-data tasks-data)
+            (let* ((task-text (cdr task-data))
+                   (id (when (string-match ":TICKTICK_ID: \\([^\n]+\\)" task-text)
+                         (match-string 1 task-text))))
+              (if (and id (not (gethash id seen-ids)))
+                  (progn
+                    (puthash id t seen-ids)
+                    (push task-data unique-tasks))
+                (message "TickTick: DEBUG:   Removing duplicate task (ID=%s)" id))))
+          (setq tasks-data (nreverse unique-tasks)))
+        (message "TickTick: DEBUG: After deduplication: %d tasks" (length tasks-data))
+        ;; Log sort-order values before sorting
+        (dolist (task-data tasks-data)
+          (let* ((task-text (cdr task-data))
+                 (title (when (string-match "^\\*\\* [A-Z]+ \\(.+\\)" task-text)
+                          (match-string 1 task-text))))
+            (message "TickTick: DEBUG:   Before sort: '%s' sortOrder=%d"
+                     (or title "?") (car task-data))))
+        ;; Sort by sort-order (ascending: smaller values first)
         (setq tasks-data (sort tasks-data (lambda (a b) (< (car a) (car b)))))
+        ;; Log sort-order values after sorting
+        (message "TickTick: DEBUG: After sorting (ascending):")
+        (dolist (task-data tasks-data)
+          (let* ((task-text (cdr task-data))
+                 (title (when (string-match "^\\*\\* [A-Z]+ \\(.+\\)" task-text)
+                          (match-string 1 task-text))))
+            (message "TickTick: DEBUG:   Sorted: '%s' sortOrder=%d"
+                     (or title "?") (car task-data))))
         ;; Delete all tasks and re-insert in sorted order
         (when tasks-data
-          ;; First, delete all tasks
-          (org-map-entries
-           (lambda ()
-             (let* ((level (org-current-level))
-                    (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
-                    (sort-order-str (org-entry-get nil "TICKTICK_SORT_ORDER")))
-               (when (and (> level project-level)
-                          (not has-project-id)
-                          sort-order-str)
-                 (delete-region (org-entry-beginning-position)
-                                (org-entry-end-position)))))
-           nil 'tree)
-          ;; Then, insert tasks in sorted order
+          (message "TickTick: DEBUG: Deleting and re-inserting tasks...")
+          ;; First, collect positions of tasks to delete (using markers)
+          (let ((positions-to-delete '()))
+            (org-map-entries
+             (lambda ()
+               (let* ((level (org-current-level))
+                      (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
+                      (sort-order-str (org-entry-get nil "TICKTICK_SORT_ORDER")))
+                 (when (and (> level project-level)
+                            (not has-project-id)
+                            sort-order-str)
+                   (push (cons (point-marker) (copy-marker (org-entry-end-position)))
+                         positions-to-delete))))
+             nil 'tree)
+            ;; Delete in reverse order to preserve earlier positions
+            (dolist (pos-pair (nreverse positions-to-delete))
+              (delete-region (marker-position (car pos-pair))
+                             (marker-position (cdr pos-pair)))))
+          ;; Then, insert tasks in sorted order and renumber sort-order from 0
           (goto-char project-pos)
           (outline-next-heading)
-          (dolist (task-data (reverse tasks-data))
-            (insert (cdr task-data))))))))
+          ;; Insert in sorted order (no reverse needed - insert moves cursor forward)
+          ;; IMPORTANT: Do NOT renumber - preserve TickTick's original sortOrder values
+          (dolist (task-data tasks-data)
+            (insert (cdr task-data)))
+          (message "TickTick: DEBUG: Sorting completed, %d tasks reordered" (length tasks-data)))))))
 
 (defun ticktick--sync-project (project backend)
   "Sync a single PROJECT (internal struct) using BACKEND.
@@ -283,8 +337,8 @@ Updates project properties but preserves the original org heading text."
     (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
       (dolist (task tasks)
         (ticktick--sync-task task project-pos))
-      ;; Sort tasks by sort-order if bidirectional mode is enabled
-      (ticktick--sort-tasks-by-sort-order project-pos))))
+      ;; Always sort tasks by sort-order when fetching from TickTick
+      (ticktick--sort-tasks-by-sort-order project-pos t))))
 
 (defun ticktick--find-task-under-project (project-heading id)
   "Return position of task heading with ID under PROJECT-HEADING."
@@ -439,10 +493,47 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
                  ;; Update task's project-id
                  (setf (ticktick-task-project-id task) project-id)
                  ;; Assign sort-order based on org heading position if enabled
-                 ;; TickTick uses negative values where smaller (more negative) = higher position
-                 (when (memq ticktick-sync-sort-order '(push-only bidirectional))
-                   (setf (ticktick-task-sort-order task) (- -1000000 sort-order-counter))
-                   (setq sort-order-counter (1+ sort-order-counter)))
+                 ;; TickTick V2 API: smaller values appear higher in the list (0, 1, 2, ...)
+                 ;; IMPORTANT: Only assign sortOrder to NEW tasks (without existing sortOrder)
+                 ;; to preserve manual sorting done in TickTick
+                 (when (and (memq ticktick-sync-sort-order '(push-only bidirectional))
+                            (not (ticktick-task-sort-order task)))
+                   ;; Calculate sortOrder based on surrounding tasks
+                   (let ((prev-sort-order nil)
+                         (next-sort-order nil))
+                     ;; Find previous task with sortOrder (loop until found)
+                     (save-excursion
+                       (while (and (outline-backward-heading)
+                                   (not prev-sort-order))
+                         (let ((prev-so (org-entry-get nil "TICKTICK_SORT_ORDER")))
+                           (when prev-so
+                             (setq prev-sort-order (string-to-number prev-so))))))
+                     ;; Find next task with sortOrder (loop until found)
+                     (save-excursion
+                       (while (and (outline-next-heading)
+                                   (not next-sort-order))
+                         (let ((next-so (org-entry-get nil "TICKTICK_SORT_ORDER")))
+                           (when next-so
+                             (setq next-sort-order (string-to-number next-so))))))
+                     ;; Calculate new sortOrder as midpoint
+                     (let ((new-sort-order
+                            (cond
+                             ;; Both prev and next exist: use midpoint
+                             ((and prev-sort-order next-sort-order)
+                              (/ (+ prev-sort-order next-sort-order) 2))
+                             ;; Only prev exists: add large offset
+                             (prev-sort-order
+                              (+ prev-sort-order 1000000))
+                             ;; Only next exists: subtract large offset
+                             (next-sort-order
+                              (- next-sort-order 1000000))
+                             ;; Neither exists: use sequential counter
+                             (t sort-order-counter))))
+                       (setf (ticktick-task-sort-order task) new-sort-order)
+                       (setq sort-order-counter (1+ sort-order-counter))
+                       (message "TickTick: DEBUG: New task '%s' assigned sortOrder=%d (prev=%s, next=%s)"
+                                (ticktick-task-title task) new-sort-order
+                                prev-sort-order next-sort-order))))
                  (message "TickTick:   Task ID: %s, Project ID: %s" (or id "none") project-id)
                  (if (and id (not (string-empty-p id)))
                      (progn
@@ -451,7 +542,9 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
                          (when updated
                            (when (ticktick-task-etag updated)
                              (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))
-                           (when (ticktick-task-sort-order updated)
+                           ;; Only save sort-order in bidirectional mode
+                           (when (and (eq ticktick-sync-sort-order 'bidirectional)
+                                      (ticktick-task-sort-order updated))
                              (org-entry-put nil "TICKTICK_SORT_ORDER"
                                             (number-to-string (ticktick-task-sort-order updated))))))
                        (ticktick-common-update-sync-meta)
@@ -463,7 +556,9 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
                          (progn
                            (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
                            (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
-                           (when (ticktick-task-sort-order created)
+                           ;; Only save sort-order in bidirectional mode
+                           (when (and (eq ticktick-sync-sort-order 'bidirectional)
+                                      (ticktick-task-sort-order created))
                              (org-entry-put nil "TICKTICK_SORT_ORDER"
                                             (number-to-string (ticktick-task-sort-order created))))
                            (ticktick-common-update-sync-meta)
@@ -530,9 +625,9 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
                                       ;; Update task's project-id
                                       (setf (ticktick-task-project-id task) project-id)
                                       ;; Assign sort-order based on org heading position if enabled
-                                      ;; TickTick uses negative values where smaller (more negative) = higher position
+                                      ;; TickTick V2 API: smaller values appear higher in the list (0, 1, 2, ...)
                                       (when (memq ticktick-sync-sort-order '(push-only bidirectional))
-                                        (setf (ticktick-task-sort-order task) (- -1000000 sort-order-counter))
+                                        (setf (ticktick-task-sort-order task) sort-order-counter)
                                         (setq sort-order-counter (1+ sort-order-counter)))
                                       (message "TickTick:     Task ID: %s, Project ID: %s" (or id "none") project-id)
                                       (if (and id (not (string-empty-p id)))
@@ -542,7 +637,9 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
                                               (when updated
                                                 (when (ticktick-task-etag updated)
                                                   (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))
-                                                (when (ticktick-task-sort-order updated)
+                                                ;; Only save sort-order in bidirectional mode
+                                                (when (and (eq ticktick-sync-sort-order 'bidirectional)
+                                                           (ticktick-task-sort-order updated))
                                                   (org-entry-put nil "TICKTICK_SORT_ORDER"
                                                                  (number-to-string (ticktick-task-sort-order updated))))))
                                             (ticktick-common-update-sync-meta)
@@ -554,7 +651,9 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
                                               (progn
                                                 (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
                                                 (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
-                                                (when (ticktick-task-sort-order created)
+                                                ;; Only save sort-order in bidirectional mode
+                                                (when (and (eq ticktick-sync-sort-order 'bidirectional)
+                                                           (ticktick-task-sort-order created))
                                                   (org-entry-put nil "TICKTICK_SORT_ORDER"
                                                                  (number-to-string (ticktick-task-sort-order created))))
                                                 (ticktick-common-update-sync-meta)
@@ -1389,28 +1488,145 @@ This only pushes local changes (push direction) and does not fetch remote update
 
 ;;; Helper Functions for Current File/Project Sync ------------------------------
 
+(defun ticktick--calculate-sort-orders (task-positions)
+  "Calculate sortOrder for new tasks in TASK-POSITIONS.
+Returns an alist of (marker . sortOrder) for tasks that need sortOrder assigned."
+  (let ((sort-order-map '())
+        (all-tasks '()))
+    ;; Step 1: Collect all tasks with their existing sortOrder
+    (dolist (pos task-positions)
+      (save-excursion
+        (goto-char (marker-position pos))
+        (let ((existing-so (org-entry-get nil "TICKTICK_SORT_ORDER")))
+          (push (cons pos existing-so) all-tasks))))
+    (setq all-tasks (nreverse all-tasks))
+
+    ;; Step 2: Process groups of new tasks
+    (let ((idx 0)
+          (len (length all-tasks)))
+      (while (< idx len)
+        (let* ((curr (nth idx all-tasks))
+               (curr-so (cdr curr)))
+          (if (not curr-so)
+              ;; Found a new task - find the group of consecutive new tasks
+              (let ((group-start idx)
+                    (group-end idx)
+                    (prev-so nil)
+                    (next-so nil))
+                ;; Find end of consecutive new tasks
+                (while (and (< group-end len)
+                            (not (cdr (nth group-end all-tasks))))
+                  (setq group-end (1+ group-end)))
+
+                ;; Find previous sortOrder
+                (when (> group-start 0)
+                  (let ((prev-so-str (cdr (nth (1- group-start) all-tasks))))
+                    (when prev-so-str
+                      (setq prev-so (string-to-number prev-so-str)))))
+
+                ;; Find next sortOrder
+                (when (< group-end len)
+                  (let ((next-so-str (cdr (nth group-end all-tasks))))
+                    (when next-so-str
+                      (setq next-so (string-to-number next-so-str)))))
+
+                ;; Calculate sortOrder for each task in group
+                (let ((group-size (- group-end group-start)))
+                  (message "TickTick: DEBUG: Processing group of %d new tasks (prev=%s, next=%s)"
+                           group-size prev-so next-so)
+                  (cond
+                   ;; Both prev and next exist: distribute evenly
+                   ((and prev-so next-so)
+                    (let ((offset (/ (- next-so prev-so) (1+ group-size))))
+                      (dotimes (i group-size)
+                        (let* ((task-entry (nth (+ group-start i) all-tasks))
+                               (new-so (+ prev-so (* (1+ i) offset))))
+                          (push (cons (car task-entry) new-so) sort-order-map)
+                          (message "TickTick: DEBUG:   Task %d: sortOrder=%d (distributed)"
+                                   i new-so)))))
+
+                   ;; Only prev exists: increment
+                   (prev-so
+                    (dotimes (i group-size)
+                      (let* ((task-entry (nth (+ group-start i) all-tasks))
+                             (new-so (+ prev-so (* (1+ i) 1000000))))
+                        (push (cons (car task-entry) new-so) sort-order-map)
+                        (message "TickTick: DEBUG:   Task %d: sortOrder=%d (after last)"
+                                 i new-so))))
+
+                   ;; Only next exists: decrement
+                   (next-so
+                    (dotimes (i group-size)
+                      (let* ((task-entry (nth (+ group-start i) all-tasks))
+                             (new-so (- next-so (* (- group-size i) 1000000))))
+                        (push (cons (car task-entry) new-so) sort-order-map)
+                        (message "TickTick: DEBUG:   Task %d: sortOrder=%d (before first)"
+                                 i new-so))))
+
+                   ;; Neither exists: renumber from 0
+                   (t
+                    (dotimes (i group-size)
+                      (let ((task-entry (nth (+ group-start i) all-tasks)))
+                        (push (cons (car task-entry) i) sort-order-map)
+                        (message "TickTick: DEBUG:   Task %d: sortOrder=%d (renumbered)"
+                                 i i))))))
+
+                ;; Move to next group
+                (setq idx group-end))
+            ;; Task already has sortOrder, skip to next
+            (setq idx (1+ idx))))))
+
+    (nreverse sort-order-map)))
+
 (defun ticktick--push-from-org-single-file (file-path)
   "Push changes from a single org FILE-PATH to TickTick."
   (let ((backend (ticktick--get-backend))
         (task-count 0)
         (created-count 0)
-        (updated-count 0))
+        (updated-count 0)
+        (task-positions '()))
     (with-current-buffer (find-file-noselect file-path)
       (org-with-wide-buffer
+       ;; First, collect all task positions using markers
        (goto-char (point-min))
        (while (outline-next-heading)
-         (when (and (= (org-current-level) 2)
-                    (not (org-entry-get nil "TICKTICK_PROJECT_ID")))
-           (setq task-count (1+ task-count))
-           (let ((title (org-get-heading t t t t)))
-             (message "TickTick: Processing task #%d: %s" task-count title))
-           (if (ticktick-common-should-sync-p)
-               (let* ((task (ticktick-common-org-to-task))
-                      (project-id (or (org-entry-get nil "TICKTICK_PROJECT_ID" t)
-                                      (ticktick--get-or-ensure-project-id backend))))
+         (let ((level (org-current-level))
+               (has-proj-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
+               (title (org-get-heading t t t t)))
+           (message "TickTick: DEBUG: Checking heading level=%d has-proj-id=%s title=%s" level has-proj-id title)
+           (when (and (= level 2)
+                      (not has-proj-id))
+             (message "TickTick: DEBUG:   -> Collecting this task")
+             (push (point-marker) task-positions))))
+       (setq task-positions (nreverse task-positions))
+       (message "TickTick: Found %d tasks to process" (length task-positions))
+
+       ;; Calculate sortOrder for new tasks
+       (let ((sort-order-map (when (memq ticktick-sync-sort-order '(push-only bidirectional))
+                               (ticktick--calculate-sort-orders task-positions))))
+
+       ;; Then, process each task
+       (dolist (pos task-positions)
+         (goto-char (marker-position pos))
+         (setq task-count (1+ task-count))
+         (message "TickTick: Processing task #%d: %s" task-count (org-get-heading t t t t))
+         (if (ticktick-common-should-sync-p)
+             (let* ((task (ticktick-common-org-to-task))
+                    (project-id (or (org-entry-get nil "TICKTICK_PROJECT_ID" t)
+                                    (ticktick--get-or-ensure-project-id backend))))
                  ;; Update task's project-id
                  (setf (ticktick-task-project-id task) project-id)
-                 (message "TickTick:   Task ID: %s, Project ID: %s" 
+                 ;; Assign sort-order for new tasks using pre-calculated values
+                 ;; IMPORTANT: Only assign sortOrder to NEW tasks (without existing sortOrder)
+                 ;; to preserve manual sorting done in TickTick
+                 (when (and (not (ticktick-task-sort-order task))
+                            sort-order-map)
+                   (let ((calculated-so (cdr (assoc pos sort-order-map))))
+                     (when calculated-so
+                       (setf (ticktick-task-sort-order task) calculated-so)
+                       (message "TickTick: DEBUG: New task '%s' assigned sortOrder=%d"
+                                (ticktick-task-title task) calculated-so))))
+                 (message "TickTick:   Task ID: %s, Project ID: %s"
                           (or (ticktick-task-id task) "none") project-id)
                  (let ((id (ticktick-task-id task)))
                    (if (and id (not (string-empty-p id)))
@@ -1419,7 +1635,10 @@ This only pushes local changes (push direction) and does not fetch remote update
                          (let ((updated (ticktick-backend-update-task backend task id project-id)))
                            (when updated
                              (when (ticktick-task-etag updated)
-                               (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))))
+                               (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))
+                             (when (ticktick-task-sort-order updated)
+                               (org-entry-put nil "TICKTICK_SORT_ORDER"
+                                              (number-to-string (ticktick-task-sort-order updated))))))
                          (ticktick-common-update-sync-meta)
                          (setq updated-count (1+ updated-count))
                          (message "TickTick:   ✓ Updated: %s" (ticktick-task-title task)))
@@ -1429,40 +1648,48 @@ This only pushes local changes (push direction) and does not fetch remote update
                            (progn
                              (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
                              (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
+                             (when (ticktick-task-sort-order created)
+                               (org-entry-put nil "TICKTICK_SORT_ORDER"
+                                              (number-to-string (ticktick-task-sort-order created))))
                              (ticktick-common-update-sync-meta)
                              (setq created-count (1+ created-count))
                              (message "TickTick:   ✓ Created: %s (ID: %s)"
                                       (ticktick-task-title created)
                                       (ticktick-task-id created)))
                          (message "TickTick:   ✗ Failed to create task"))))))
-             (message "TickTick:   Task needs sync: no (skipped)"))))
+           (message "TickTick:   Task needs sync: no (skipped)"))
+         )))
        (save-buffer)
        (message "TickTick: Push completed - %d tasks found, %d created, %d updated"
                 task-count created-count updated-count))))
 
 (defun ticktick--fetch-to-org-single-file (file-path)
   "Fetch tasks from TickTick to a single org FILE-PATH."
+  (message "TickTick: Fetching tasks from TickTick...")
   (let* ((backend (ticktick--get-backend))
          (projects (ticktick-backend-fetch-projects backend)))
+    (message "TickTick: Found %d projects in TickTick" (length projects))
     (with-current-buffer (find-file-noselect file-path)
       (org-with-wide-buffer
        (dolist (project projects)
-(let* ((project-id (ticktick-project-id project))
-                 (project-title (ticktick-project-name project))
-                 (project-heading-re (format "^\\* %s$" (regexp-quote project-title)))
-                 (project-pos (save-excursion
-                                (goto-char (point-min))
-                                (when (re-search-forward project-heading-re nil t)
-                                  (match-beginning 0)))))
-            (when project-pos
-              (goto-char project-pos)
-              (outline-show-subtree)
-              (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
-                (dolist (task tasks)
-                  (ticktick--sync-task task project-pos))
-                ;; Sort tasks by sort-order if bidirectional mode is enabled
-                (ticktick--sort-tasks-by-sort-order project-pos)))))
-       (save-buffer)))))
+         (let* ((project-id (ticktick-project-id project))
+                (project-title (ticktick-project-name project))
+                ;; Use ticktick--find-project-heading to handle sanitized names and ID matching
+                (project-pos (ticktick--find-project-heading project-title project-id)))
+           (if project-pos
+               (progn
+                 (message "TickTick: Fetching tasks for project '%s'..." project-title)
+                 (goto-char project-pos)
+                 (outline-show-subtree)
+                 (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
+                   (message "TickTick:   Found %d tasks" (length tasks))
+                   (dolist (task tasks)
+                     (ticktick--sync-task task project-pos))
+                   ;; Always sort tasks by sort-order when fetching from TickTick
+                   (ticktick--sort-tasks-by-sort-order project-pos t)))
+             (message "TickTick: Project '%s' not found in current file, skipping" project-title))))
+       (save-buffer)
+       (message "TickTick: Fetch completed")))))
 
 (defun ticktick--push-from-org-single-project (backend project-pos project-id)
   "Push changes from a single project at PROJECT-POS with PROJECT-ID."
@@ -1473,37 +1700,50 @@ This only pushes local changes (push direction) and does not fetch remote update
           (created-count 0)
           (updated-count 0)
           (skipped-count 0)
-          (sort-order-counter 0))
+          (task-positions '()))
 
-      ;; Process all subtasks under this project
+      ;; Step 1: Collect all task positions
       (save-excursion
-        (let ((end-of-project (save-excursion
-                              (goto-char project-pos)
-                              (org-end-of-subtree t t))))
-          (goto-char project-pos)
-          (org-map-entries
-           (lambda ()
-             (let* ((level (org-current-level))
-                    (title (org-get-heading t t t t))
-                    (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
-                    (should-sync (ticktick-common-should-sync-p)))
-               ;; Only process if:
-               ;; 1. Level is deeper than project level (not the project itself)
-               ;; 2. Does NOT have TICKTICK_PROJECT_ID (not a nested project)
-               (when (and (> level project-level)
-                          (not has-project-id))
-                 (setq task-count (1+ task-count))
-                 (message "TickTick:   Task #%d (level %d): %s" task-count level title)
-                 (if should-sync
-                     (let* ((task (ticktick-common-org-to-task))
-                            (id (ticktick-task-id task)))
-                       ;; Update task's project-id
-                       (setf (ticktick-task-project-id task) project-id)
-                       ;; Assign sort-order based on org heading position if enabled
-                       ;; TickTick uses negative values where smaller (more negative) = higher position
-                       (when (memq ticktick-sync-sort-order '(push-only bidirectional))
-                         (setf (ticktick-task-sort-order task) (- -1000000 sort-order-counter))
-                         (setq sort-order-counter (1+ sort-order-counter)))
+        (org-map-entries
+         (lambda ()
+           (let* ((level (org-current-level))
+                  (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
+             ;; Only collect if:
+             ;; 1. Level is deeper than project level (not the project itself)
+             ;; 2. Does NOT have TICKTICK_PROJECT_ID (not a nested project)
+             (when (and (> level project-level)
+                        (not has-project-id))
+               (push (point-marker) task-positions))))
+         nil 'tree))
+      (setq task-positions (nreverse task-positions))
+
+      ;; Step 2: Calculate sortOrder for new tasks
+      (let ((sort-order-map (when (memq ticktick-sync-sort-order '(push-only bidirectional))
+                              (ticktick--calculate-sort-orders task-positions))))
+
+        ;; Step 3: Process each task
+        (dolist (pos task-positions)
+          (goto-char (marker-position pos))
+          (let* ((level (org-current-level))
+                 (title (org-get-heading t t t t))
+                 (should-sync (ticktick-common-should-sync-p)))
+            (setq task-count (1+ task-count))
+            (message "TickTick:   Task #%d (level %d): %s" task-count level title)
+            (if should-sync
+                (let* ((task (ticktick-common-org-to-task))
+                       (id (ticktick-task-id task)))
+                  ;; Update task's project-id
+                  (setf (ticktick-task-project-id task) project-id)
+                  ;; Assign sort-order for new tasks using pre-calculated values
+                  ;; IMPORTANT: Only assign sortOrder to NEW tasks (without existing sortOrder)
+                  ;; to preserve manual sorting done in TickTick
+                  (when (and (not (ticktick-task-sort-order task))
+                             sort-order-map)
+                    (let ((calculated-so (cdr (assoc pos sort-order-map))))
+                      (when calculated-so
+                        (setf (ticktick-task-sort-order task) calculated-so)
+                        (message "TickTick: DEBUG: New task '%s' assigned sortOrder=%d"
+                                 (ticktick-task-title task) calculated-so))))
                        (message "TickTick:     Task ID: %s, Project ID: %s" 
                                 (or id "none") project-id)
                        (if (and id (not (string-empty-p id)))
@@ -1515,10 +1755,10 @@ This only pushes local changes (push direction) and does not fetch remote update
                                    (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))
                                  (when (ticktick-task-sort-order updated)
                                    (org-entry-put nil "TICKTICK_SORT_ORDER"
-                                                  (number-to-string (ticktick-task-sort-order updated))))))
-                             (ticktick-common-update-sync-meta)
-                             (setq updated-count (1+ updated-count))
-                             (message "TickTick:     ✓ Updated"))
+                                                  (number-to-string (ticktick-task-sort-order updated))))
+                                 (ticktick-common-update-sync-meta)
+                                 (setq updated-count (1+ updated-count))
+                                 (message "TickTick:     ✓ Updated"))))
                          (message "TickTick:     Creating...")
                          (let ((created (ticktick-backend-create-task backend task project-id)))
                            (if created
@@ -1532,12 +1772,12 @@ This only pushes local changes (push direction) and does not fetch remote update
                                  (setq created-count (1+ created-count))
                                  (message "TickTick:     ✓ Created (ID: %s)" (ticktick-task-id created)))
                              (message "TickTick:     ✗ Failed to create")))))
-                   (setq skipped-count (1+ skipped-count))
-                   (message "TickTick:     Skipped (no changes)")))))
-           nil 'tree)))
-      
+              (setq skipped-count (1+ skipped-count))
+              (message "TickTick:     Skipped (no changes)"))))
+        )
+
       (message "TickTick:   Project summary: %d tasks, %d created, %d updated, %d skipped"
-               task-count created-count updated-count skipped-count)))))
+               task-count created-count updated-count skipped-count))))
 
 (defun ticktick--fetch-to-org-single-project (backend project-pos project-id)
   "Fetch tasks for a single project at PROJECT-POS with PROJECT-ID."
@@ -1547,8 +1787,8 @@ This only pushes local changes (push direction) and does not fetch remote update
     (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
       (dolist (task tasks)
         (ticktick--sync-task task project-pos))
-      ;; Sort tasks by sort-order if bidirectional mode is enabled
-      (ticktick--sort-tasks-by-sort-order project-pos))))
+      ;; Always sort tasks by sort-order when fetching from TickTick
+      (ticktick--sort-tasks-by-sort-order project-pos t))))
 
 ;;; Task Ordering Functions -----------------------------------------------
 
