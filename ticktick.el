@@ -1804,15 +1804,14 @@ Returns an alist of (marker . sortOrder) for tasks that need sortOrder assigned.
   (save-excursion
     (goto-char project-pos)
     (outline-show-subtree)
-    (let ((tasks (ticktick-backend-fetch-tasks backend project-id))
-          (index 0))
-      (message "TickTick: Fetched %d tasks from API, reassigning sortOrder based on API order" (length tasks))
+    (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
+      (message "TickTick: Fetched %d tasks from API, using sortOrder from TickTick" (length tasks))
       (dolist (task tasks)
-        ;; Reassign sortOrder based on API response order (0, 1, 2, ...)
-        ;; TickTick API returns tasks in the correct visual order
-        (setf (ticktick-task-sort-order task) index)
-        (message "TickTick:   Task '%s' assigned sortOrder=%d" (ticktick-task-title task) index)
-        (setq index (1+ index))
+        ;; Keep sortOrder from TickTick API (don't reassign)
+        ;; The API returns each task with its correct sortOrder value
+        (message "TickTick:   Task '%s' sortOrder=%s"
+                 (ticktick-task-title task)
+                 (or (ticktick-task-sort-order task) "nil"))
         (ticktick--sync-task task project-pos))
       ;; Always sort tasks by sort-order when fetching from TickTick
       (ticktick--sort-tasks-by-sort-order project-pos t))))
