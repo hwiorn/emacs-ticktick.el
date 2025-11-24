@@ -193,6 +193,64 @@ Return the buffer position at the start of the heading."
     (insert (ticktick-common-project-to-org project))
     start))
 
+(defun ticktick--collect-org-task-ids (project-pos)
+  "Collect all TICKTICK_ID values from tasks under PROJECT-POS.
+Returns a list of task ID strings."
+  (let ((project-level (save-excursion
+                          (goto-char project-pos)
+                          (org-current-level)))
+        (task-ids '()))
+    (save-excursion
+      (goto-char project-pos)
+      (org-map-entries
+       (lambda ()
+         (let* ((level (org-current-level))
+                (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
+                (task-id (org-entry-get nil "TICKTICK_ID")))
+           ;; Collect tasks: deeper than project level, no TICKTICK_PROJECT_ID, has TICKTICK_ID
+           (when (and (> level project-level)
+                      (not has-project-id)
+                      task-id
+                      (not (string-empty-p task-id)))
+             (push task-id task-ids))))
+       nil 'tree))
+    (nreverse task-ids)))
+
+(defun ticktick--delete-org-tasks-by-ids (project-pos task-ids)
+  "Delete org tasks under PROJECT-POS that have TICKTICK_ID in TASK-IDS list."
+  (when task-ids
+    (let ((project-level (save-excursion
+                           (goto-char project-pos)
+                           (org-current-level)))
+          (deleted-count 0))
+      (save-excursion
+        (goto-char project-pos)
+        ;; Collect positions to delete (in reverse order for safe deletion)
+        (let ((positions-to-delete '()))
+          (org-map-entries
+           (lambda ()
+             (let* ((level (org-current-level))
+                    (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
+                    (task-id (org-entry-get nil "TICKTICK_ID"))
+                    (title (org-get-heading t t t t)))
+               (when (and (> level project-level)
+                          (not has-project-id)
+                          task-id
+                          (member task-id task-ids))
+                 (message "TickTick: Will delete task '%s' (ID: %s)" title task-id)
+                 (push (cons (point-marker)
+                             (copy-marker (org-entry-end-position)))
+                       positions-to-delete))))
+           nil 'tree)
+          ;; Delete in reverse order to preserve positions
+          (dolist (pos-pair (nreverse positions-to-delete))
+            (delete-region (marker-position (car pos-pair))
+                           (marker-position (cdr pos-pair)))
+            (setq deleted-count (1+ deleted-count)))))
+      (when (> deleted-count 0)
+        (message "TickTick: Deleted %d task(s) from org-mode" deleted-count))
+      deleted-count)))
+
 (defun ticktick--sync-task (task project-pos)
   "Sync a single TASK (internal struct) under PROJECT-POS."
   (let* ((id (ticktick-task-id task))
@@ -347,19 +405,40 @@ Only sorts when `ticktick-sync-sort-order' is 'bidirectional, unless FORCE is no
 
 (defun ticktick--sync-project (project backend)
   "Sync a single PROJECT (internal struct) using BACKEND.
-Updates project properties but preserves the original org heading text."
+Updates project properties and heading name if changed in TickTick."
   (let* ((project-id (ticktick-project-id project))
          (project-title (ticktick-project-name project))
          (project-pos (ticktick--find-project-heading project-title project-id)))
     (unless project-pos
       (setq project-pos (ticktick--create-project-heading project)))
     (goto-char project-pos)
-    ;; Update project properties (color, view-mode, kind) but preserve heading
+    ;; Update project properties
     (when project-pos
       (org-entry-put nil "TICKTICK_PROJECT_ID" project-id)
       (org-entry-put nil "TICKTICK_PROJECT_COLOR" (ticktick-project-color project))
       (org-entry-put nil "TICKTICK_PROJECT_VIEWMODE" (ticktick-project-view-mode project))
-      (org-entry-put nil "TICKTICK_PROJECT_KIND" (ticktick-project-kind project)))
+      (org-entry-put nil "TICKTICK_PROJECT_KIND" (ticktick-project-kind project))
+
+      ;; Update heading name if changed in TickTick (preserve statistics cookies)
+      (let* ((current-heading (org-get-heading t t t t))
+             ;; Extract statistics cookie if present
+             (stats-cookie (when (string-match "\\(\\[\\([0-9]+\\)/\\([0-9]+\\)\\]\\|\\[\\([0-9]+\\)%\\]\\)\\s-*$" current-heading)
+                             (match-string 0 current-heading)))
+             ;; Get current name without cookie
+             (current-name (ticktick-common--sanitize-project-name
+                           (if stats-cookie
+                               (replace-regexp-in-string "\\s-*\\[.*\\]\\s-*$" "" current-heading)
+                             current-heading)))
+             ;; New name from TickTick (already sanitized in project struct)
+             (new-name project-title))
+        (unless (string= current-name new-name)
+          (message "TickTick: Project name changed in TickTick: '%s' -> '%s'" current-name new-name)
+          ;; Update heading with new name, preserving statistics cookie
+          (let ((new-heading (if stats-cookie
+                                (concat new-name " " stats-cookie)
+                              new-name)))
+            (org-edit-headline new-heading)
+            (message "TickTick:   ✓ Project name updated in org")))))
     (outline-show-subtree)
     (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
       (dolist (task tasks)
@@ -432,7 +511,22 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
     (with-current-buffer (find-file-noselect ticktick-sync-file)
       (org-with-wide-buffer
        (dolist (project projects)
-         (ticktick--sync-project project backend))
+         (let* ((project-id (ticktick-project-id project))
+                (project-name (ticktick-project-name project))
+                (project-pos (ticktick--find-project-heading project-name project-id)))
+           (if project-pos
+               (progn
+                 (message "TickTick: Fetching tasks for project '%s'..." project-name)
+                 ;; Calculate deleted-by-user for this project
+                 (let* ((org-ids-current (ticktick--collect-org-task-ids project-pos))
+                        (ticktick-tasks (ticktick-backend-fetch-tasks backend project-id))
+                        (ticktick-ids (mapcar #'ticktick-task-id ticktick-tasks))
+                        (deleted-by-user (cl-set-difference ticktick-ids org-ids-current :test #'string=)))
+                   (when deleted-by-user
+                     (message "TickTick: Detected %d task(s) deleted by user in project '%s'"
+                              (length deleted-by-user) project-name))
+                   (ticktick--fetch-to-org-single-project backend project-pos project-id org-ids-current deleted-by-user)))
+             (message "TickTick: Project '%s' not found, skipping" project-name))))
        (save-buffer)))))
 
 (defun ticktick--fetch-to-org-multi ()
@@ -465,21 +559,25 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
                (if project-heading-pos
                    ;; Project exists - update it
                    (progn
-                     (goto-char project-heading-pos)
-                     (outline-show-subtree)
-                     (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
-                       (dolist (task tasks)
-                         (ticktick--sync-task task project-heading-pos))))
+                     (message "TickTick: Fetching tasks for project '%s'..." project-name)
+                     ;; Calculate deleted-by-user for this project
+                     (let* ((org-ids-current (ticktick--collect-org-task-ids project-heading-pos))
+                            (ticktick-tasks (ticktick-backend-fetch-tasks backend project-id))
+                            (ticktick-ids (mapcar #'ticktick-task-id ticktick-tasks))
+                            (deleted-by-user (cl-set-difference ticktick-ids org-ids-current :test #'string=)))
+                       (when deleted-by-user
+                         (message "TickTick: Detected %d task(s) deleted by user in project '%s'"
+                                  (length deleted-by-user) project-name))
+                       (ticktick--fetch-to-org-single-project backend project-heading-pos project-id org-ids-current deleted-by-user)))
 
                  ;; Project doesn't exist - only create if fallback file
                  (when (string= target-file fallback-file)
                    (let ((new-pos (ticktick--create-project-heading project)))
-                     (outline-show-subtree)
-                     (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
-                       (dolist (task tasks)
-                         (ticktick--sync-task task new-pos))))))))
+                     (message "TickTick: Creating new project '%s'..." project-name)
+                     ;; For new projects, no deleted tasks (empty list)
+                     (ticktick--fetch-to-org-single-project backend new-pos project-id '() '())))))
            (save-buffer)))))
-    (message "Multi-file synchronization completed")))
+    (message "Multi-file synchronization completed"))))
 
 ;;;###autoload
 (defun ticktick-push-from-org ()
@@ -496,111 +594,35 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
       (ticktick--push-from-org-single))))
 
 (defun ticktick--push-from-org-single ()
-  "Push tasks from single org file."
-  (let ((backend (ticktick--get-backend))
-        (changes '())
-        (task-count 0)
-        (created-count 0)
-        (updated-count 0)
-        (sort-order-counter 0))
+  "Push tasks from single org file with deletion tracking."
+  (let* ((backend (ticktick--get-backend))
+         ;; Get default project ID for single-file mode
+         (default-project-id (ticktick--get-or-ensure-project-id backend)))
+    (unless default-project-id
+      (error "TickTick: Cannot get default project ID for single-file mode"))
+
     (with-current-buffer (find-file-noselect ticktick-sync-file)
       (org-with-wide-buffer
-       (goto-char (point-min))
-       (while (outline-next-heading)
-         (when (and (= (org-current-level) 2)
-                    (not (org-entry-get nil "TICKTICK_PROJECT_ID")))
-           (setq task-count (1+ task-count))
-           (let ((title (org-get-heading t t t t)))
-             (message "TickTick: Processing task #%d: %s" task-count title))
-           (if (ticktick-common-should-sync-p)
-               (let* ((task (ticktick-common-org-to-task))
-                      (project-id (or (org-entry-get nil "TICKTICK_PROJECT_ID" t)
-                                      (ticktick--get-or-ensure-project-id backend)))
-                      (id (ticktick-task-id task)))
-                 ;; Update task's project-id
-                 (setf (ticktick-task-project-id task) project-id)
-                 ;; Assign sort-order based on org heading position if enabled
-                 ;; TickTick V2 API: smaller values appear higher in the list (0, 1, 2, ...)
-                 ;; IMPORTANT: Only assign sortOrder to NEW tasks (without existing sortOrder)
-                 ;; to preserve manual sorting done in TickTick
-                 (when (and (memq ticktick-sync-sort-order '(push-only bidirectional))
-                            (not (ticktick-task-sort-order task)))
-                   ;; Calculate sortOrder based on surrounding tasks
-                   (let ((prev-sort-order nil)
-                         (next-sort-order nil))
-                     ;; Find previous task with sortOrder (loop until found)
-                     (save-excursion
-                       (while (and (outline-backward-heading)
-                                   (not prev-sort-order))
-                         (let ((prev-so (org-entry-get nil "TICKTICK_SORT_ORDER")))
-                           (when prev-so
-                             (setq prev-sort-order (string-to-number prev-so))))))
-                     ;; Find next task with sortOrder (loop until found)
-                     (save-excursion
-                       (while (and (outline-next-heading)
-                                   (not next-sort-order))
-                         (let ((next-so (org-entry-get nil "TICKTICK_SORT_ORDER")))
-                           (when next-so
-                             (setq next-sort-order (string-to-number next-so))))))
-                     ;; Calculate new sortOrder as midpoint
-                     (let ((new-sort-order
-                            (cond
-                             ;; Both prev and next exist: use midpoint
-                             ((and prev-sort-order next-sort-order)
-                              (/ (+ prev-sort-order next-sort-order) 2))
-                             ;; Only prev exists: add large offset
-                             (prev-sort-order
-                              (+ prev-sort-order 1000000))
-                             ;; Only next exists: subtract large offset
-                             (next-sort-order
-                              (- next-sort-order 1000000))
-                             ;; Neither exists: use sequential counter
-                             (t sort-order-counter))))
-                       (setf (ticktick-task-sort-order task) new-sort-order)
-                       (setq sort-order-counter (1+ sort-order-counter))
-                       (message "TickTick: DEBUG: New task '%s' assigned sortOrder=%d (prev=%s, next=%s)"
-                                (ticktick-task-title task) new-sort-order
-                                prev-sort-order next-sort-order))))
-                 (message "TickTick:   Task ID: %s, Project ID: %s" (or id "none") project-id)
-                 (if (and id (not (string-empty-p id)))
-                     (progn
-                       (message "TickTick:   Updating task...")
-                       (let ((updated (ticktick-backend-update-task backend task id project-id)))
-                         (when updated
-                           (when (ticktick-task-etag updated)
-                             (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))
-                           ;; Only save sort-order in bidirectional mode
-                           (when (and (eq ticktick-sync-sort-order 'bidirectional)
-                                      (ticktick-task-sort-order updated))
-                             (org-entry-put nil "TICKTICK_SORT_ORDER"
-                                            (number-to-string (ticktick-task-sort-order updated))))))
-                       (ticktick-common-update-sync-meta)
-                       (setq updated-count (1+ updated-count))
-                       (message "TickTick:   ✓ Updated: %s" (ticktick-task-title task)))
-                   (message "TickTick:   Creating new task...")
-                   (let ((created (ticktick-backend-create-task backend task project-id)))
-                     (if created
-                         (progn
-                           (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
-                           (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
-                           ;; Only save sort-order in bidirectional mode
-                           (when (and (eq ticktick-sync-sort-order 'bidirectional)
-                                      (ticktick-task-sort-order created))
-                             (org-entry-put nil "TICKTICK_SORT_ORDER"
-                                            (number-to-string (ticktick-task-sort-order created))))
-                           (ticktick-common-update-sync-meta)
-                           (setq created-count (1+ created-count))
-                           (message "TickTick:   ✓ Created: %s (ID: %s)"
-                                    (ticktick-task-title created)
-                                    (ticktick-task-id created)))
-                       (message "TickTick:   ✗ Failed to create task")))))
-             (message "TickTick:   Task needs sync: no (skipped)"))))
-       (save-buffer)
-       (message "TickTick: Push completed - %d tasks found, %d created, %d updated"
-                task-count created-count updated-count)))))
+       ;; Calculate deletion tracking for the entire file (treated as one project)
+       ;; Find the virtual project root (point-min for single-file mode)
+       (let* ((project-pos (point-min))
+              (org-ids-current (ticktick--collect-org-task-ids project-pos))
+              (ticktick-tasks (ticktick-backend-fetch-tasks backend default-project-id))
+              (ticktick-ids (mapcar #'ticktick-task-id ticktick-tasks))
+              (deleted-by-user (cl-set-difference ticktick-ids org-ids-current :test #'string=)))
+
+         (message "TickTick: Single-file push - %d tasks in org, %d in TickTick"
+                  (length org-ids-current) (length ticktick-ids))
+         (when deleted-by-user
+           (message "TickTick: Detected %d task(s) deleted by user in org" (length deleted-by-user)))
+
+         ;; Call project-level push with deletion tracking
+         (ticktick--push-from-org-single-project backend project-pos default-project-id
+                                                 deleted-by-user ticktick-ids)))
+      (save-buffer))))
 
 (defun ticktick--push-from-org-multi ()
-  "Push tasks from multiple org files."
+  "Push tasks from multiple org files with deletion tracking."
   (message "DEBUG: ticktick--push-from-org-multi CALLED")
   (let ((backend (ticktick--get-backend))
         (project-files (ticktick--scan-org-files-for-projects)))
@@ -617,97 +639,37 @@ Sanitizes project names when matching (removes cookies and invalid chars)."
                (goto-char pos)
                (let* ((project-name (funcall ticktick-project-name-function))
                       (project-id (ticktick--get-or-create-project-id project-name backend)))
-                 (message "TickTick: Project '%s' -> ID: %s" project-name project-id)
+                 (message "TickTick: Pushing tasks for project '%s'..." project-name)
                  (when project-id
-                   (let ((task-count 0)
-                         (created-count 0)
-                         (updated-count 0)
-                         (skipped-count 0)
-                         (sort-order-counter 0))
-                     ;; Process all subtasks under this project
-                     ;; Skip the project heading itself and only process descendants
-                     (save-excursion
-                       (goto-char pos)
-                       (let ((project-level (org-current-level))
-                             (end-of-project (save-excursion
-                                               (goto-char pos)
-                                               (org-end-of-subtree t t))))
-                         ;; Use org-map-entries with a filter to skip the project itself
-                         (org-map-entries
-                          (lambda ()
-                            (let* ((level (org-current-level))
-                                   (title (org-get-heading t t t t))
-                                   (has-project-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
-                                   (should-sync (ticktick-common-should-sync-p)))
-                              ;; Only process if:
-                              ;; 1. Level is deeper than project level (not the project itself)
-                              ;; 2. Does NOT have TICKTICK_PROJECT_ID (not a nested project)
-                              (when (and (> level project-level)
-                                         (not has-project-id))
-                                (setq task-count (1+ task-count))
-                                (message "TickTick:   Task #%d (level %d): %s" task-count level title)
-                                (if should-sync
-                                    (let* ((task (ticktick-common-org-to-task))
-                                           (id (ticktick-task-id task)))
-                                      ;; Update task's project-id
-                                      (setf (ticktick-task-project-id task) project-id)
-                                      ;; Assign sort-order based on org heading position if enabled
-                                      ;; TickTick V2 API: smaller values appear higher in the list (0, 1, 2, ...)
-                                      (when (memq ticktick-sync-sort-order '(push-only bidirectional))
-                                        (setf (ticktick-task-sort-order task) sort-order-counter)
-                                        (setq sort-order-counter (1+ sort-order-counter)))
-                                      (message "TickTick:     Task ID: %s, Project ID: %s" (or id "none") project-id)
-                                      (if (and id (not (string-empty-p id)))
-                                          (progn
-                                            (message "TickTick:     Updating...")
-                                            (let ((updated (ticktick-backend-update-task backend task id project-id)))
-                                              (when updated
-                                                (when (ticktick-task-etag updated)
-                                                  (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))
-                                                ;; Only save sort-order in bidirectional mode
-                                                (when (and (eq ticktick-sync-sort-order 'bidirectional)
-                                                           (ticktick-task-sort-order updated))
-                                                  (org-entry-put nil "TICKTICK_SORT_ORDER"
-                                                                 (number-to-string (ticktick-task-sort-order updated))))))
-                                            (ticktick-common-update-sync-meta)
-                                            (setq updated-count (1+ updated-count))
-                                            (message "TickTick:     ✓ Updated"))
-                                        (message "TickTick:     Creating...")
-                                        (let ((created (ticktick-backend-create-task backend task project-id)))
-                                          (if created
-                                              (progn
-                                                (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
-                                                (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
-                                                ;; Only save sort-order in bidirectional mode
-                                                (when (and (eq ticktick-sync-sort-order 'bidirectional)
-                                                           (ticktick-task-sort-order created))
-                                                  (org-entry-put nil "TICKTICK_SORT_ORDER"
-                                                                 (number-to-string (ticktick-task-sort-order created))))
-                                                (ticktick-common-update-sync-meta)
-                                                (setq created-count (1+ created-count))
-                                                (message "TickTick:     ✓ Created (ID: %s)" (ticktick-task-id created)))
-                                            (message "TickTick:     ✗ Failed to create")))))
-                                  (setq skipped-count (1+ skipped-count))
-                                  (message "TickTick:     Skipped (no changes)")))))
-                          nil 'tree)))
-                     (message "TickTick:   Project summary: %d tasks, %d created, %d updated, %d skipped"
-                              task-count created-count updated-count skipped-count))))))
+                   ;; Calculate deletion tracking for this project
+                   (let* ((org-ids-current (ticktick--collect-org-task-ids pos))
+                          (ticktick-tasks (ticktick-backend-fetch-tasks backend project-id))
+                          (ticktick-ids (mapcar #'ticktick-task-id ticktick-tasks))
+                          (deleted-by-user (cl-set-difference ticktick-ids org-ids-current :test #'string=)))
+                     (when deleted-by-user
+                       (message "TickTick: Detected %d task(s) deleted by user in project '%s'"
+                                (length deleted-by-user) project-name))
+                     ;; Call project-level push with deletion tracking
+                     (ticktick--push-from-org-single-project backend pos project-id
+                                                             deleted-by-user ticktick-ids))))))
            (save-buffer)))))
     (message "TickTick: Push from org files completed")))
 
 ;;;###autoload
 (defun ticktick-sync ()
-  "Two-way sync: push local changes first, then fetch remote updates."
+  "Two-way sync: fetch remote updates first, then push local changes.
+Order changed to Fetch→Push to properly detect user deletions."
   (interactive)
   (message "DEBUG: === ticktick-sync CALLED ===")
   (message "DEBUG: ticktick-multi-file-support = %s" ticktick-multi-file-support)
   (ticktick--ensure-backend)
-  (message "DEBUG: Calling ticktick-push-from-org...")
-  (ticktick-push-from-org)
-  (message "DEBUG: Calling sit-for...")
-  (sit-for 1)
+  ;; NEW ORDER: Fetch first to detect deletions, then Push
   (message "DEBUG: Calling ticktick-fetch-to-org...")
   (ticktick-fetch-to-org)
+  (message "DEBUG: Calling sit-for...")
+  (sit-for 1)
+  (message "DEBUG: Calling ticktick-push-from-org...")
+  (ticktick-push-from-org)
   (message "DEBUG: === ticktick-sync DONE ==="))
 
 ;;; Utility/Admin Commands ---------------------------------------------------
@@ -1344,27 +1306,28 @@ This allows matching by ID when available, or by name as fallback."
   "Sync the current org file with TickTick.
 This function will:
 1. Check if current file is a valid org file
-2. Push local changes to TickTick
-3. Fetch remote updates from TickTick
+2. Fetch remote updates from TickTick (Fetch first for proper delete sync)
+3. Push local changes to TickTick
 4. Update only the current file"
   (interactive)
   (unless (eq major-mode 'org-mode)
     (user-error "Current buffer is not in org-mode"))
-  
+
   (unless (buffer-file-name)
     (user-error "Current buffer is not visiting a file"))
-  
+
   (ticktick--ensure-backend)
   (let ((file-path (buffer-file-name)))
     (message "TickTick: Syncing current file: %s" (file-name-nondirectory file-path))
-    
-    ;; Step 1: Push local changes
-    (ticktick--push-from-org-single-file file-path)
-    
-    ;; Step 2: Fetch remote updates
-    (sit-for 1)  ; Brief pause to avoid conflicts
+
+    ;; NEW SYNC FLOW: Fetch → Push (for proper bidirectional delete sync)
+    ;; Step 1: Fetch remote updates first
     (ticktick--fetch-to-org-single-file file-path)
-    
+
+    ;; Step 2: Push local changes
+    (sit-for 1)  ; Brief pause to avoid conflicts
+    (ticktick--push-from-org-single-file file-path)
+
     (message "TickTick: Current file sync completed")))
 
 ;;;###autoload
@@ -1416,13 +1379,29 @@ This function will:
             (org-entry-put nil "TICKTICK_PROJECT_ID" project-id)))
         
         (when project-id
-          ;; Step 1: Push local changes for this project
-          (ticktick--push-from-org-single-project backend project-pos project-id)
-          
-          ;; Step 2: Fetch remote updates for this project
-          (sit-for 1)  ; Brief pause to avoid conflicts
-          (ticktick--fetch-to-org-single-project backend project-pos project-id)
-          
+          ;; NEW SYNC FLOW: Detect deletions first, then Fetch → Push
+
+          ;; Step 0: Pre-sync state collection to detect user deletions
+          (let* ((org-ids-current (ticktick--collect-org-task-ids project-pos))
+                 (ticktick-tasks-initial (ticktick-backend-fetch-tasks backend project-id))
+                 (ticktick-ids (mapcar #'ticktick-task-id ticktick-tasks-initial))
+                 ;; Tasks in TickTick but not in org = user deleted from org
+                 (deleted-by-user (cl-set-difference ticktick-ids org-ids-current :test #'string=)))
+
+            (message "TickTick: Found %d task(s) in org, %d in TickTick"
+                     (length org-ids-current) (length ticktick-ids))
+            (when deleted-by-user
+              (message "TickTick: Detected %d task(s) deleted by user in org" (length deleted-by-user)))
+
+            ;; Step 1: Fetch remote updates (but don't re-add user-deleted tasks)
+            (ticktick--fetch-to-org-single-project backend project-pos project-id
+                                                   org-ids-current deleted-by-user)
+
+            ;; Step 2: Push local changes (delete user-deleted tasks from TickTick)
+            (sit-for 1)  ; Brief pause to avoid conflicts
+            (ticktick--push-from-org-single-project backend project-pos project-id
+                                                    deleted-by-user ticktick-ids))
+
           (message "TickTick: Project sync completed: %s" project-name))))))
 
 ;;;###autoload
@@ -1466,7 +1445,10 @@ This only fetches updates (pull direction) and does not push local changes."
             (org-entry-put nil "TICKTICK_PROJECT_ID" project-id)))
         
         (when project-id
-          (ticktick--fetch-to-org-single-project backend project-pos project-id)
+          ;; Collect current org task IDs before fetch
+          (let ((org-ids-before (ticktick--collect-org-task-ids project-pos)))
+            ;; For fetch-only, no user deletions to track (empty list)
+            (ticktick--fetch-to-org-single-project backend project-pos project-id org-ids-before '()))
           (message "TickTick: Project fetch completed: %s" project-name))))))
 
 ;;;###autoload
@@ -1510,7 +1492,13 @@ This only pushes local changes (push direction) and does not fetch remote update
             (org-entry-put nil "TICKTICK_PROJECT_ID" project-id)))
         
         (when project-id
-          (ticktick--push-from-org-single-project backend project-pos project-id)
+          ;; Collect current org task IDs and TickTick task IDs
+          (let* ((org-ids-current (ticktick--collect-org-task-ids project-pos))
+                 (ticktick-tasks (ticktick-backend-fetch-tasks backend project-id))
+                 (ticktick-ids (mapcar #'ticktick-task-id ticktick-tasks))
+                 ;; Find tasks deleted by user (in TickTick but not in org)
+                 (deleted-by-user (cl-set-difference ticktick-ids org-ids-current :test #'string=)))
+            (ticktick--push-from-org-single-project backend project-pos project-id deleted-by-user ticktick-ids))
           (message "TickTick: Project push completed: %s" project-name))))))
 
 ;;; Helper Functions for Current File/Project Sync ------------------------------
@@ -1606,89 +1594,39 @@ Returns an alist of (marker . sortOrder) for tasks that need sortOrder assigned.
     (nreverse sort-order-map)))
 
 (defun ticktick--push-from-org-single-file (file-path)
-  "Push changes from a single org FILE-PATH to TickTick."
-  (let ((backend (ticktick--get-backend))
-        (task-count 0)
-        (created-count 0)
-        (updated-count 0)
-        (task-positions '()))
+  "Push changes from a single org FILE-PATH to TickTick with deletion tracking."
+  (let ((backend (ticktick--get-backend)))
     (with-current-buffer (find-file-noselect file-path)
       (org-with-wide-buffer
-       ;; First, collect all task positions using markers
+       ;; Find all project headings in this file
        (goto-char (point-min))
-       (while (outline-next-heading)
-         (let ((level (org-current-level))
-               (has-proj-id (org-entry-get nil "TICKTICK_PROJECT_ID"))
-               (title (org-get-heading t t t t)))
-           (message "TickTick: DEBUG: Checking heading level=%d has-proj-id=%s title=%s" level has-proj-id title)
-           (when (and (= level 2)
-                      (not has-proj-id))
-             (message "TickTick: DEBUG:   -> Collecting this task")
-             (push (point-marker) task-positions))))
-       (setq task-positions (nreverse task-positions))
-       (message "TickTick: Found %d tasks to process" (length task-positions))
+       (let ((project-positions '()))
+         ;; Collect all level-1 headings with TICKTICK_PROJECT_ID
+         (while (outline-next-heading)
+           (when (and (= (org-current-level) 1)
+                      (org-entry-get nil "TICKTICK_PROJECT_ID"))
+             (push (point-marker) project-positions)))
 
-       ;; Calculate sortOrder for new tasks
-       (let ((sort-order-map (when (memq ticktick-sync-sort-order '(push-only bidirectional))
-                               (ticktick--calculate-sort-orders task-positions))))
-
-       ;; Then, process each task
-       (dolist (pos task-positions)
-         (goto-char (marker-position pos))
-         (setq task-count (1+ task-count))
-         (message "TickTick: Processing task #%d: %s" task-count (org-get-heading t t t t))
-         (if (ticktick-common-should-sync-p)
-             (let* ((task (ticktick-common-org-to-task))
-                    (project-id (or (org-entry-get nil "TICKTICK_PROJECT_ID" t)
-                                    (ticktick--get-or-ensure-project-id backend))))
-                 ;; Update task's project-id
-                 (setf (ticktick-task-project-id task) project-id)
-                 ;; Assign sort-order for new tasks using pre-calculated values
-                 ;; IMPORTANT: Only assign sortOrder to NEW tasks (without existing sortOrder)
-                 ;; to preserve manual sorting done in TickTick
-                 (when (and (not (ticktick-task-sort-order task))
-                            sort-order-map)
-                   (let ((calculated-so (cdr (assoc pos sort-order-map))))
-                     (when calculated-so
-                       (setf (ticktick-task-sort-order task) calculated-so)
-                       (message "TickTick: DEBUG: New task '%s' assigned sortOrder=%d"
-                                (ticktick-task-title task) calculated-so))))
-                 (message "TickTick:   Task ID: %s, Project ID: %s"
-                          (or (ticktick-task-id task) "none") project-id)
-                 (let ((id (ticktick-task-id task)))
-                   (if (and id (not (string-empty-p id)))
-                       (progn
-                         (message "TickTick:   Updating task...")
-                         (let ((updated (ticktick-backend-update-task backend task id project-id)))
-                           (when updated
-                             (when (ticktick-task-etag updated)
-                               (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag updated)))
-                             (when (ticktick-task-sort-order updated)
-                               (org-entry-put nil "TICKTICK_SORT_ORDER"
-                                              (number-to-string (ticktick-task-sort-order updated))))))
-                         (ticktick-common-update-sync-meta)
-                         (setq updated-count (1+ updated-count))
-                         (message "TickTick:   ✓ Updated: %s" (ticktick-task-title task)))
-                     (message "TickTick:   Creating new task...")
-                     (let ((created (ticktick-backend-create-task backend task project-id)))
-                       (if created
-                           (progn
-                             (org-entry-put nil "TICKTICK_ID" (ticktick-task-id created))
-                             (org-entry-put nil "TICKTICK_ETAG" (ticktick-task-etag created))
-                             (when (ticktick-task-sort-order created)
-                               (org-entry-put nil "TICKTICK_SORT_ORDER"
-                                              (number-to-string (ticktick-task-sort-order created))))
-                             (ticktick-common-update-sync-meta)
-                             (setq created-count (1+ created-count))
-                             (message "TickTick:   ✓ Created: %s (ID: %s)"
-                                      (ticktick-task-title created)
-                                      (ticktick-task-id created)))
-                         (message "TickTick:   ✗ Failed to create task"))))))
-           (message "TickTick:   Task needs sync: no (skipped)"))
-         )))
+         ;; Process each project with deletion tracking
+         (dolist (project-pos project-positions)
+           (goto-char (marker-position project-pos))
+           (let* ((project-name (funcall ticktick-project-name-function))
+                  (project-id (org-entry-get nil "TICKTICK_PROJECT_ID")))
+             (when project-id
+               (message "TickTick: Pushing tasks for project '%s'..." project-name)
+               ;; Calculate deletion tracking for this project
+               (let* ((org-ids-current (ticktick--collect-org-task-ids project-pos))
+                      (ticktick-tasks (ticktick-backend-fetch-tasks backend project-id))
+                      (ticktick-ids (mapcar #'ticktick-task-id ticktick-tasks))
+                      (deleted-by-user (cl-set-difference ticktick-ids org-ids-current :test #'string=)))
+                 (when deleted-by-user
+                   (message "TickTick: Detected %d task(s) deleted by user in project '%s'"
+                            (length deleted-by-user) project-name))
+                 ;; Call project-level push with deletion tracking
+                 (ticktick--push-from-org-single-project backend project-pos project-id
+                                                         deleted-by-user ticktick-ids))))))
        (save-buffer)
-       (message "TickTick: Push completed - %d tasks found, %d created, %d updated"
-                task-count created-count updated-count))))
+       (message "TickTick: Push completed")))))
 
 (defun ticktick--fetch-to-org-single-file (file-path)
   "Fetch tasks from TickTick to a single org FILE-PATH."
@@ -1706,20 +1644,24 @@ Returns an alist of (marker . sortOrder) for tasks that need sortOrder assigned.
            (if project-pos
                (progn
                  (message "TickTick: Fetching tasks for project '%s'..." project-title)
-                 (goto-char project-pos)
-                 (outline-show-subtree)
-                 (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
-                   (message "TickTick:   Found %d tasks" (length tasks))
-                   (dolist (task tasks)
-                     (ticktick--sync-task task project-pos))
-                   ;; Always sort tasks by sort-order when fetching from TickTick
-                   (ticktick--sort-tasks-by-sort-order project-pos t)))
+                 ;; Calculate deleted-by-user for this project
+                 (let* ((org-ids-current (ticktick--collect-org-task-ids project-pos))
+                        (ticktick-tasks (ticktick-backend-fetch-tasks backend project-id))
+                        (ticktick-ids (mapcar #'ticktick-task-id ticktick-tasks))
+                        (deleted-by-user (cl-set-difference ticktick-ids org-ids-current :test #'string=)))
+                   (when deleted-by-user
+                     (message "TickTick: Detected %d task(s) deleted by user in project '%s'"
+                              (length deleted-by-user) project-title))
+                   (ticktick--fetch-to-org-single-project backend project-pos project-id org-ids-current deleted-by-user)))
              (message "TickTick: Project '%s' not found in current file, skipping" project-title))))
        (save-buffer)
        (message "TickTick: Fetch completed")))))
 
-(defun ticktick--push-from-org-single-project (backend project-pos project-id)
-  "Push changes from a single project at PROJECT-POS with PROJECT-ID."
+(defun ticktick--push-from-org-single-project (backend project-pos project-id deleted-by-user ticktick-ids-current)
+  "Push changes from a single project at PROJECT-POS with PROJECT-ID.
+DELETED-BY-USER is a list of task IDs that user deleted from org.
+TICKTICK-IDS-CURRENT is a list of task IDs currently in TickTick.
+Tasks in DELETED-BY-USER will be deleted from TickTick."
   (save-excursion
     (goto-char project-pos)
     (let ((project-level (org-current-level))
@@ -1727,7 +1669,41 @@ Returns an alist of (marker . sortOrder) for tasks that need sortOrder assigned.
           (created-count 0)
           (updated-count 0)
           (skipped-count 0)
+          (deleted-count 0)
           (task-positions '()))
+
+      ;; Step 0: Handle deletions - delete user-deleted tasks from TickTick
+      (when deleted-by-user
+        (message "TickTick: Deleting %d task(s) from TickTick" (length deleted-by-user))
+        (dolist (task-id deleted-by-user)
+          (condition-case err
+              (progn
+                (message "TickTick: Deleting task from TickTick (ID: %s)" task-id)
+                (ticktick-backend-delete-task backend task-id project-id)
+                (setq deleted-count (1+ deleted-count))
+                (message "TickTick:   ✓ Deleted from TickTick"))
+            (error
+             (message "TickTick:   ✗ Failed to delete: %s" (error-message-string err))))))
+
+      ;; Step 0.5: Check if project name changed and update if needed
+      (let* ((org-project (ticktick-common-org-to-project))
+             (org-project-name (ticktick-project-name org-project))
+             ;; Fetch current project from TickTick to compare names
+             (ticktick-projects (ticktick-backend-fetch-projects backend))
+             (ticktick-project (cl-find-if (lambda (p) (string= (ticktick-project-id p) project-id))
+                                           ticktick-projects)))
+        (when ticktick-project
+          (let ((ticktick-project-name (ticktick-project-name ticktick-project)))
+            (unless (string= org-project-name ticktick-project-name)
+              (message "TickTick: Project name changed: '%s' -> '%s'" ticktick-project-name org-project-name)
+              (condition-case err
+                  (progn
+                    ;; Update project with new name
+                    (setf (ticktick-project-id org-project) project-id)
+                    (ticktick-backend-update-project backend org-project project-id)
+                    (message "TickTick:   ✓ Project name updated in TickTick"))
+                (error
+                 (message "TickTick:   ✗ Failed to update project: %s" (error-message-string err))))))))
 
       ;; Step 1: Collect all task positions
       (save-excursion
@@ -1745,27 +1721,22 @@ Returns an alist of (marker . sortOrder) for tasks that need sortOrder assigned.
       (setq task-positions (nreverse task-positions))
 
       ;; Step 2: Process each task
-      (let ((task-index 0))
-        (dolist (pos task-positions)
-          (goto-char (marker-position pos))
-          (let* ((level (org-current-level))
-                 (title (org-get-heading t t t t))
-                 (should-sync (ticktick-common-should-sync-p)))
-            (setq task-count (1+ task-count))
-            (message "TickTick:   Task #%d (level %d): %s" task-count level title)
-            (if should-sync
-                (let* ((task (ticktick-common-org-to-task))
-                       (id (ticktick-task-id task)))
-                  ;; Update task's project-id
-                  (setf (ticktick-task-project-id task) project-id)
-                  ;; Assign sortOrder based on org-mode heading order
-                  ;; This ensures org-mode order is pushed to TickTick
-                  (when (memq ticktick-sync-sort-order '(push-only bidirectional))
-                    (setf (ticktick-task-sort-order task) task-index)
-                    (message "TickTick:     Assigned sortOrder=%d based on org position" task-index))
-                  (setq task-index (1+ task-index))
-                  (message "TickTick:     Task ID: %s, Project ID: %s"
-                           (or id "none") project-id)
+      (dolist (pos task-positions)
+        (goto-char (marker-position pos))
+        (let* ((level (org-current-level))
+               (title (org-get-heading t t t t))
+               (should-sync (ticktick-common-should-sync-p)))
+          (setq task-count (1+ task-count))
+          (message "TickTick:   Task #%d (level %d): %s" task-count level title)
+          (if should-sync
+              (let* ((task (ticktick-common-org-to-task))
+                     (id (ticktick-task-id task)))
+                ;; Update task's project-id
+                (setf (ticktick-task-project-id task) project-id)
+                ;; Don't assign sortOrder - keep the value from org (from TickTick)
+                ;; This preserves TickTick's sortOrder instead of overwriting it
+                (message "TickTick:     Task ID: %s, Project ID: %s"
+                         (or id "none") project-id)
                   (if (and id (not (string-empty-p id)))
                       (progn
                         (message "TickTick:     Updating...")
@@ -1792,27 +1763,76 @@ Returns an alist of (marker . sortOrder) for tasks that need sortOrder assigned.
                             (setq created-count (1+ created-count))
                             (message "TickTick:     ✓ Created (ID: %s)" (ticktick-task-id created)))
                         (message "TickTick:     ✗ Failed to create")))))
-              (setq skipped-count (1+ skipped-count))
-              (message "TickTick:     Skipped (no changes)"))))
-        )
+            (setq skipped-count (1+ skipped-count))
+            (message "TickTick:     Skipped (no changes)"))))
 
-      (message "TickTick:   Project summary: %d tasks, %d created, %d updated, %d skipped"
-               task-count created-count updated-count skipped-count))))
+      (message "TickTick:   Project summary: %d tasks, %d created, %d updated, %d deleted, %d skipped"
+               task-count created-count updated-count deleted-count skipped-count))))
 
-(defun ticktick--fetch-to-org-single-project (backend project-pos project-id)
-  "Fetch tasks for a single project at PROJECT-POS with PROJECT-ID."
+(defun ticktick--fetch-to-org-single-project (backend project-pos project-id org-ids-before deleted-by-user)
+  "Fetch tasks for a single project at PROJECT-POS with PROJECT-ID.
+ORG-IDS-BEFORE is a list of TICKTICK_ID values that existed in org before sync.
+DELETED-BY-USER is a list of task IDs that user deleted from org.
+Tasks that are in ORG-IDS-BEFORE but not in the fetched tasks will be deleted from org.
+Tasks in DELETED-BY-USER will not be re-added to org."
   (save-excursion
     (goto-char project-pos)
     (outline-show-subtree)
+
+    ;; Step 0: Update project name if changed in TickTick
+    (let* ((ticktick-projects (ticktick-backend-fetch-projects backend))
+           (ticktick-project (cl-find-if (lambda (p) (string= (ticktick-project-id p) project-id))
+                                         ticktick-projects)))
+      (when ticktick-project
+        (let* ((current-heading (org-get-heading t t t t))
+               ;; Extract statistics cookie if present
+               (stats-cookie (when (string-match "\\(\\[\\([0-9]+\\)/\\([0-9]+\\)\\]\\|\\[\\([0-9]+\\)%\\]\\)\\s-*$" current-heading)
+                               (match-string 0 current-heading)))
+               ;; Get current name without cookie
+               (current-name (ticktick-common--sanitize-project-name
+                             (if stats-cookie
+                                 (replace-regexp-in-string "\\s-*\\[.*\\]\\s-*$" "" current-heading)
+                               current-heading)))
+               ;; New name from TickTick
+               (new-name (ticktick-project-name ticktick-project)))
+          (unless (string= current-name new-name)
+            (message "TickTick: Project name changed in TickTick: '%s' -> '%s'" current-name new-name)
+            ;; Update heading with new name, preserving statistics cookie
+            (let ((new-heading (if stats-cookie
+                                  (concat new-name " " stats-cookie)
+                                new-name)))
+              (org-edit-headline new-heading)
+              (message "TickTick:   ✓ Project name updated in org"))))))
+
     (let ((tasks (ticktick-backend-fetch-tasks backend project-id)))
       (message "TickTick: Fetched %d tasks from API, using sortOrder from TickTick" (length tasks))
+
+      ;; Collect task IDs from TickTick
+      (let ((ticktick-ids (mapcar #'ticktick-task-id tasks)))
+        ;; Find tasks that exist in org but not in TickTick (deleted in TickTick)
+        (let ((deleted-in-ticktick (cl-set-difference org-ids-before ticktick-ids :test #'string=)))
+          (when deleted-in-ticktick
+            (message "TickTick: Found %d task(s) deleted in TickTick" (length deleted-in-ticktick))
+            (ticktick--delete-org-tasks-by-ids project-pos deleted-in-ticktick))))
+
+      ;; Sync tasks from TickTick to org
       (dolist (task tasks)
         ;; Keep sortOrder from TickTick API (don't reassign)
         ;; The API returns each task with its correct sortOrder value
         (message "TickTick:   Task '%s' sortOrder=%s"
                  (ticktick-task-title task)
                  (or (ticktick-task-sort-order task) "nil"))
-        (ticktick--sync-task task project-pos))
+        (let ((task-id (ticktick-task-id task))
+              (existing-pos (ticktick--find-task-under-project project-pos (ticktick-task-id task))))
+          (if existing-pos
+              ;; Task exists in org - update it
+              (ticktick--sync-task task project-pos)
+            ;; Task doesn't exist in org - check if user deleted it
+            (if (member task-id deleted-by-user)
+                ;; Task was deleted by user - don't re-add it
+                (message "TickTick:     Task was deleted by user in org, skipping re-add")
+              ;; Task is new or was deleted in TickTick before - add it to org
+              (ticktick--sync-task task project-pos)))))
       ;; Always sort tasks by sort-order when fetching from TickTick
       (ticktick--sort-tasks-by-sort-order project-pos t))))
 
